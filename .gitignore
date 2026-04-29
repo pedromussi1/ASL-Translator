@@ -36,6 +36,18 @@ yarn-error.log*
 # vercel
 .vercel
 
+# Python training artifacts
+training/__pycache__/
+training/.venv/
+training/venv/
+training/data/
+training/runs/
+training/*.pth
+*.pyc
+
+# Claude Code per-project settings (local-only)
+.claude/
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

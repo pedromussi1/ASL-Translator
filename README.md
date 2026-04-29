@@ -1,36 +1,84 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# ASL Translator
 
-## Getting Started
+A real-time American Sign Language → text + speech translator that runs **entirely in your browser**. No frames ever leave your device.
 
-First, run the development server:
+> **Status:** Phase 1 in progress (alphabet / fingerspelling). Personal learning project.
 
-```bash
+## Phased roadmap
+
+| Phase | Scope | Status |
+|---|---|---|
+| 1 | Fingerspelling alphabet A–Z + 0–9 + a few common dynamic signs (J, Z, hello, thank you, yes) | in progress |
+| 2 | Vocabulary recognition (~250–1000 signs) + Tauri 2 desktop wrapper | planned |
+| 3 | Continuous conversational ASL + iOS (Swift + CoreML) | research / future |
+
+## Stack
+
+- **Web:** Next.js 16 (App Router) + TypeScript + Tailwind CSS
+- **Hand tracking:** [`@mediapipe/tasks-vision`](https://www.npmjs.com/package/@mediapipe/tasks-vision) (HandLandmarker) — GPU delegate with WASM fallback
+- **Inference:** [`onnxruntime-web`](https://onnxruntime.ai/docs/get-started/with-javascript.html) (WASM EP; WebGPU when available)
+- **Speech output:** Web Speech API behind a `TTSProvider` interface (so we can plug ElevenLabs / Azure later)
+- **Tests:** Vitest
+- **Training (separate, Python):** PyTorch + MediaPipe Python for landmark extraction, exported to ONNX
+
+## Run locally
+
+```sh
+npm install
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+# open http://localhost:3000 and grant camera access
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Repo layout (Phase 1, single app — no monorepo until Phase 2)
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```
+src/
+├── app/                       # Next.js App Router routes
+├── components/
+│   ├── CameraView.tsx         # owns the rAF loop, brightness sampling, status
+│   └── LandmarkOverlay.tsx    # canvas wireframe + joints, color-coded by handedness
+└── lib/
+    ├── camera/index.ts        # getUserMedia wrapper, brightness check, device list
+    ├── recognition/
+    │   ├── handLandmarker.ts  # MediaPipe Tasks-Vision wrapper (GPU→CPU fallback)
+    │   ├── normalize.ts       # wrist-relative, scale-invariant features (mirror left hand)
+    │   ├── types.ts           # shared types
+    │   ├── classifier.ts      # ONNX Runtime Web wrapper                  [planned]
+    │   ├── dynamicLstm.ts     # 30-frame LSTM for J/Z/hello/...           [planned]
+    │   └── wordBuffer.ts      # state machine: letters → words → speech   [planned]
+    └── tts/
+        ├── provider.ts        # TTSProvider interface
+        └── webSpeech.ts       # Web Speech API implementation with barge-in
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+public/models/                 # versioned ONNX artifacts (added during training)
+training/                      # Python PyTorch training scripts
+docs/DECISIONS.md              # ADR log (architecture decisions + rationale)
+```
 
-## Learn More
+## Scripts
 
-To learn more about Next.js, take a look at the following resources:
+```sh
+npm run dev          # Next.js dev server (Turbopack)
+npm run build        # production build
+npm run lint         # ESLint
+npm test             # Vitest, single run
+npm run test:watch   # Vitest, watch mode
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## Architecture notes
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+The big design decisions and their rationale live in [`docs/DECISIONS.md`](docs/DECISIONS.md). Highlights:
 
-## Deploy on Vercel
+- **Single Next.js app for Phase 1.** Monorepo overhead is deferred until Phase 2 actually needs `packages/core` for desktop reuse.
+- **All inference on-device.** Privacy is a real product feature here, not a footnote.
+- **Pluggable TTS interface from day one** so Phase 2 can drop in cloud TTS without refactors.
+- **Public datasets only** (Kaggle ASL Alphabet for Phase 1) — and the project stays a personal learning effort. Commercializing would require a first-party dataset built with paid Deaf signers; that's deliberately out of scope.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Acknowledgements
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- Hand landmark detection: [Google MediaPipe](https://developers.google.com/mediapipe).
+- Phase 1 training data (when added): [Kaggle ASL Alphabet datasets](https://www.kaggle.com/datasets) (CC-licensed variants).
+
+## License
+
+[MIT](LICENSE)
