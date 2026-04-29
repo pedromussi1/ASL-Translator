@@ -1,0 +1,24 @@
+# Phase 1 training requirements.
+#
+# Two tiers — install only what you need:
+#
+#   Tier 1: just produce a stub ONNX so the browser pipeline can be wired up.
+#           Tiny install (~50 MB).
+#
+#       pip install -r requirements.txt --no-deps onnx numpy
+#
+#   Tier 2: real training on the Kaggle ASL Alphabet dataset.
+#           Adds PyTorch + MediaPipe + scikit-learn (~3 GB).
+#
+#       pip install -r requirements.txt
+#
+# We pin loosely so the script keeps working with newer minor releases.
+onnx>=1.16
+numpy>=1.26
+
+# Tier 2 — comment these out if you only need the stub ONNX.
+torch>=2.2
+mediapipe>=0.10.20
+opencv-python-headless>=4.10
+scikit-learn>=1.4
+tqdm>=4.66
