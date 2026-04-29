@@ -42,6 +42,7 @@ training/.venv/
 training/venv/
 training/data/
 training/runs/
+training/.cache/
 training/*.pth
 *.pyc
 

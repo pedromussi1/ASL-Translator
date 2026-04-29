@@ -113,6 +113,9 @@ def main() -> int:
     labels_path = OUTPUT_DIR / "labels.json"
 
     dummy = torch.zeros(1, 63, device=device)
+    # Use the legacy TorchScript exporter (`dynamo=False`) so we get a single
+    # self-contained .onnx file without an external `.data` sidecar. Our model
+    # is ~70 KB — external data only complicates static serving for no benefit.
     torch.onnx.export(
         model,
         dummy,
@@ -120,7 +123,8 @@ def main() -> int:
         input_names=["input"],
         output_names=["output"],
         opset_version=17,
-        dynamic_axes=None,  # batch size fixed to 1 — that's fine for live inference
+        dynamic_axes=None,  # batch size fixed to 1 — fine for live inference
+        dynamo=False,
     )
     labels_path.write_text(json.dumps(labels, indent=2))
 

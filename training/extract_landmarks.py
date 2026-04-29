@@ -6,7 +6,7 @@ Expected input layout (e.g. Kaggle's "ASL Alphabet" dataset):
     ...
     data/asl_alphabet_train/Z/...
 
-We walk every class folder, run MediaPipe HandLandmarker on each image,
+We walk every class folder, run MediaPipe Tasks HandLandmarker on each image,
 normalize the landmarks the same way the browser does (wrist-relative,
 scale-invariant, mirror left hands), and serialize one big NPZ that the
 training script consumes.
@@ -17,8 +17,10 @@ Output:
         y: int64   [N]   (class index)
         labels: list[str]   (label vocabulary, in index order)
 
-Run from the `training/` directory:
-    python extract_landmarks.py --input data/asl_alphabet_train --output data/landmarks.npz
+Run from the repo root:
+    python training/extract_landmarks.py \
+        --input training/data/asl_alphabet_train/asl_alphabet_train \
+        --output training/data/landmarks.npz
 """
 
 from __future__ import annotations
@@ -26,20 +28,43 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import urllib.request
 from pathlib import Path
 
 import cv2
 import mediapipe as mp
 import numpy as np
+from mediapipe.tasks.python import BaseOptions
+from mediapipe.tasks.python.vision import (
+    HandLandmarker,
+    HandLandmarkerOptions,
+    RunningMode,
+)
 from tqdm import tqdm
 
 CLASS_VOCAB = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ") + list("0123456789")
+
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+    "hand_landmarker/float16/latest/hand_landmarker.task"
+)
+
+
+def ensure_model(cache_dir: Path) -> Path:
+    """Download the HandLandmarker .task file if not already present."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    local_path = cache_dir / "hand_landmarker.task"
+    if local_path.exists() and local_path.stat().st_size > 1_000_000:
+        return local_path
+    print(f"Downloading hand_landmarker.task -> {local_path}")
+    urllib.request.urlretrieve(MODEL_URL, str(local_path))
+    return local_path
 
 
 def normalize_landmarks(pts: np.ndarray, handedness: str, mirror_left: bool = True) -> np.ndarray:
     """Mirror of `src/lib/recognition/normalize.ts`. Keeps train and inference aligned.
 
-    pts: [21, 3] float32, x/y normalized to [0,1] and z relative to wrist.
+    pts: [21, 3] float32, x/y normalized to [0,1] image space, z relative to wrist.
     """
     wrist = pts[0]
     middle_mcp = pts[9]
@@ -54,13 +79,12 @@ def normalize_landmarks(pts: np.ndarray, handedness: str, mirror_left: bool = Tr
 
 def discover_classes(root: Path) -> list[str]:
     found = sorted(p.name for p in root.iterdir() if p.is_dir())
-    # Keep the canonical order; warn if anything is missing.
     missing = set(CLASS_VOCAB) - set(found)
     extra = set(found) - set(CLASS_VOCAB)
     if missing:
-        print(f"WARN: missing class folders: {sorted(missing)}", file=sys.stderr)
+        print(f"NOTE: missing class folders (expected): {sorted(missing)}", file=sys.stderr)
     if extra:
-        print(f"WARN: ignoring unexpected folders: {sorted(extra)}", file=sys.stderr)
+        print(f"NOTE: ignoring non-letter folders: {sorted(extra)}", file=sys.stderr)
     return [c for c in CLASS_VOCAB if c in found]
 
 
@@ -68,8 +92,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True, help="Folder of class subdirs containing images.")
     ap.add_argument("--output", required=True, help="Path to write the NPZ.")
-    ap.add_argument("--max-per-class", type=int, default=None, help="Cap samples per class (debug).")
+    ap.add_argument("--max-per-class", type=int, default=None, help="Cap samples per class (debug/speed).")
     ap.add_argument("--no-mirror", action="store_true", help="Disable left-hand mirroring.")
+    ap.add_argument("--cache-dir", default=str(Path(__file__).parent / ".cache"), help="Where to cache the .task model.")
     args = ap.parse_args()
 
     in_root = Path(args.input).resolve()
@@ -81,39 +106,39 @@ def main() -> int:
         print(f"No class folders found under {in_root}", file=sys.stderr)
         return 2
 
-    landmarker = mp.solutions.hands.Hands(
-        static_image_mode=True,
-        max_num_hands=1,
-        model_complexity=1,
-        min_detection_confidence=0.5,
+    model_path = ensure_model(Path(args.cache_dir))
+    options = HandLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=str(model_path)),
+        running_mode=RunningMode.IMAGE,
+        num_hands=1,
     )
 
     X_rows: list[np.ndarray] = []
     y_rows: list[int] = []
     skipped = 0
 
-    for cls_idx, cls_name in enumerate(classes):
-        files = sorted((in_root / cls_name).glob("*"))
-        if args.max_per_class:
-            files = files[: args.max_per_class]
-        for fpath in tqdm(files, desc=f"{cls_name}", leave=False):
-            img = cv2.imread(str(fpath))
-            if img is None:
-                skipped += 1
-                continue
-            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            res = landmarker.process(rgb)
-            if not res.multi_hand_landmarks or not res.multi_handedness:
-                skipped += 1
-                continue
-            lm = res.multi_hand_landmarks[0]
-            pts = np.array([[p.x, p.y, p.z] for p in lm.landmark], dtype=np.float32)
-            handed = res.multi_handedness[0].classification[0].label  # "Left"/"Right"
-            vec = normalize_landmarks(pts, handed, mirror_left=not args.no_mirror)
-            X_rows.append(vec)
-            y_rows.append(cls_idx)
-
-    landmarker.close()
+    with HandLandmarker.create_from_options(options) as landmarker:
+        for cls_idx, cls_name in enumerate(classes):
+            files = sorted((in_root / cls_name).glob("*"))
+            if args.max_per_class:
+                files = files[: args.max_per_class]
+            for fpath in tqdm(files, desc=f"{cls_name:>3}", leave=False):
+                img = cv2.imread(str(fpath))
+                if img is None:
+                    skipped += 1
+                    continue
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                result = landmarker.detect(mp_image)
+                if not result.hand_landmarks or not result.handedness:
+                    skipped += 1
+                    continue
+                lm = result.hand_landmarks[0]
+                pts = np.array([[p.x, p.y, p.z] for p in lm], dtype=np.float32)
+                handed = result.handedness[0][0].category_name  # "Left" / "Right"
+                vec = normalize_landmarks(pts, handed, mirror_left=not args.no_mirror)
+                X_rows.append(vec)
+                y_rows.append(cls_idx)
 
     if not X_rows:
         print("No usable samples extracted.", file=sys.stderr)
