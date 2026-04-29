@@ -43,6 +43,58 @@ class AlphabetMLP(nn.Module):
         return self.fc3(x)
 
 
+def augment_landmarks(
+    x: torch.Tensor,
+    rot_deg: float = 15.0,
+    scale_range: float = 0.1,
+    jitter_std: float = 0.01,
+) -> torch.Tensor:
+    """Online augmentation for normalized landmarks. x: [B, 63].
+
+    Applies:
+      - Small random 3D rotation around the wrist (origin).
+      - Small uniform scale jitter.
+      - Per-landmark Gaussian noise.
+
+    These force the MLP to learn shape features that are robust to camera
+    angle, distance, and per-signer variation — the gap that hurt accuracy
+    on hands different from the training signer's.
+    """
+    B = x.shape[0]
+    device = x.device
+    pts = x.view(B, 21, 3)
+
+    theta = (torch.rand(B, 3, device=device) * 2 - 1) * (rot_deg * torch.pi / 180.0)
+    cx, sx = torch.cos(theta[:, 0]), torch.sin(theta[:, 0])
+    cy, sy = torch.cos(theta[:, 1]), torch.sin(theta[:, 1])
+    cz, sz = torch.cos(theta[:, 2]), torch.sin(theta[:, 2])
+    z = torch.zeros_like(cx)
+    o = torch.ones_like(cx)
+
+    Rx = torch.stack([
+        torch.stack([o, z, z], dim=-1),
+        torch.stack([z, cx, -sx], dim=-1),
+        torch.stack([z, sx, cx], dim=-1),
+    ], dim=-2)
+    Ry = torch.stack([
+        torch.stack([cy, z, sy], dim=-1),
+        torch.stack([z, o, z], dim=-1),
+        torch.stack([-sy, z, cy], dim=-1),
+    ], dim=-2)
+    Rz = torch.stack([
+        torch.stack([cz, -sz, z], dim=-1),
+        torch.stack([sz, cz, z], dim=-1),
+        torch.stack([z, z, o], dim=-1),
+    ], dim=-2)
+    R = Rz @ Ry @ Rx
+    pts = torch.bmm(pts, R.transpose(-1, -2))
+
+    scale = 1 + (torch.rand(B, 1, 1, device=device) * 2 - 1) * scale_range
+    pts = pts * scale
+    pts = pts + torch.randn_like(pts) * jitter_std
+    return pts.view(B, 63)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--landmarks", required=True, help="Path to landmarks.npz from extract_landmarks.py")
@@ -83,6 +135,7 @@ def main() -> int:
         loss_sum, n = 0.0, 0
         for xb, yb in train_loader:
             xb, yb = xb.to(device), yb.to(device)
+            xb = augment_landmarks(xb)
             optim.zero_grad()
             logits = model(xb)
             loss = F.cross_entropy(logits, yb)

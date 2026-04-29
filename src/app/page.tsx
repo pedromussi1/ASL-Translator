@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { CameraView, type CameraStatus } from "@/components/CameraView";
 import { AlphabetClassifier } from "@/lib/recognition/classifier";
 import { normalizeHand } from "@/lib/recognition/normalize";
+import { PredictionSmoother } from "@/lib/recognition/smoother";
 import type { DetectedHand, FrameResult, Prediction } from "@/lib/recognition/types";
 import { WordBuffer } from "@/lib/recognition/wordBuffer";
 import { WebSpeechProvider } from "@/lib/tts/webSpeech";
@@ -25,6 +26,7 @@ export default function Home() {
   });
 
   const classifierRef = useRef<AlphabetClassifier | null>(null);
+  const smootherRef = useRef<PredictionSmoother | null>(null);
   const bufferRef = useRef<WordBuffer | null>(null);
   const ttsRef = useRef<WebSpeechProvider | null>(null);
   const inflightRef = useRef(false);
@@ -32,6 +34,7 @@ export default function Home() {
   // Initialize the singletons once.
   useEffect(() => {
     bufferRef.current = new WordBuffer();
+    smootherRef.current = new PredictionSmoother(5);
     ttsRef.current = new WebSpeechProvider();
     const off = bufferRef.current.on((e) => {
       if (e.type === "letter_committed") {
@@ -87,10 +90,11 @@ export default function Home() {
 
   const onFrame = useCallback(async (result: FrameResult) => {
     const buf = bufferRef.current;
+    const smoother = smootherRef.current;
     const cls = classifierRef.current;
-    if (!buf) return;
+    if (!buf || !smoother) return;
     if (!cls || result.hands.length === 0) {
-      buf.feed(null, result.timestampMs);
+      buf.feed(smoother.push(null), result.timestampMs);
       return;
     }
     // Skip the frame if a previous recognition is still in flight to avoid
@@ -100,8 +104,8 @@ export default function Home() {
     try {
       const hand = pickPrimaryHand(result.hands);
       const norm = normalizeHand(hand.landmarks, hand.handedness);
-      const pred: Prediction = await cls.recognize(norm);
-      buf.feed(pred, result.timestampMs);
+      const raw: Prediction = await cls.recognize(norm);
+      buf.feed(smoother.push(raw), result.timestampMs);
     } finally {
       inflightRef.current = false;
     }
@@ -109,6 +113,7 @@ export default function Home() {
 
   const handleClear = () => {
     bufferRef.current?.clear();
+    smootherRef.current?.reset();
     setTranscript([]);
     ttsRef.current?.cancel();
   };
