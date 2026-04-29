@@ -1,12 +1,16 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CalibrationOverlay, type CalibrationPhase } from "@/components/CalibrationOverlay";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  CalibrationOverlay,
+  type RecordingPhase,
+} from "@/components/CalibrationOverlay";
 import { CameraView, type CameraStatus } from "@/components/CameraView";
 import {
   CALIBRATION_FRAMES_PER_LETTER,
   CalibratedClassifier,
-  CalibrationSession,
+  LetterRecorder,
+  type CalibrationData,
 } from "@/lib/recognition/calibratedClassifier";
 import { AlphabetClassifier } from "@/lib/recognition/classifier";
 import { normalizeHand } from "@/lib/recognition/normalize";
@@ -16,16 +20,16 @@ import { WordBuffer } from "@/lib/recognition/wordBuffer";
 import { WebSpeechProvider } from "@/lib/tts/webSpeech";
 
 const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
+const PREVIEW_MS = 1200; // "Get ready…" before recording starts on Record click
+const SAVED_FLASH_MS = 700; // how long to show "Saved ✓" before returning to grid
 
 type Mode = "translate" | "calibrate";
 
 type ClassifierState =
   | { kind: "loading" }
-  | { kind: "trained"; cls: AlphabetClassifier; calibrated: false }
+  | { kind: "trained"; cls: AlphabetClassifier }
   | { kind: "calibrated"; cls: CalibratedClassifier; sampleCounts: Record<string, number> }
   | { kind: "error"; message: string };
-
-const PREVIEW_MS = 1500; // "Get ready…" duration before recording starts
 
 export default function Home() {
   const [started, setStarted] = useState(false);
@@ -39,31 +43,32 @@ export default function Home() {
   });
 
   const [mode, setMode] = useState<Mode>("translate");
-  const [calIdx, setCalIdx] = useState(0);
-  const [calPhase, setCalPhase] = useState<CalibrationPhase>("preview");
-  const [calRecordedCount, setCalRecordedCount] = useState(0);
+  const [calibrationData, setCalibrationData] = useState<CalibrationData | null>(null);
+  const [recordingLetter, setRecordingLetter] = useState<string | null>(null);
+  const [recordingPhase, setRecordingPhase] = useState<RecordingPhase>("idle");
+  const [recordedCount, setRecordedCount] = useState(0);
 
   const smootherRef = useRef<PredictionSmoother | null>(null);
   const bufferRef = useRef<WordBuffer | null>(null);
   const ttsRef = useRef<WebSpeechProvider | null>(null);
   const inflightRef = useRef(false);
   const classifierRef = useRef<AlphabetClassifier | CalibratedClassifier | null>(null);
+  const recorderRef = useRef<LetterRecorder | null>(null);
 
-  const calSessionRef = useRef<CalibrationSession | null>(null);
-  // Snapshot of mode/phase/index for the async onFrame closure.
+  // Refs that mirror state for the async onFrame closure.
   const modeRef = useRef<Mode>("translate");
-  const calIdxRef = useRef(0);
-  const calPhaseRef = useRef<CalibrationPhase>("preview");
+  const recordingLetterRef = useRef<string | null>(null);
+  const recordingPhaseRef = useRef<RecordingPhase>("idle");
 
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
   useEffect(() => {
-    calIdxRef.current = calIdx;
-  }, [calIdx]);
+    recordingLetterRef.current = recordingLetter;
+  }, [recordingLetter]);
   useEffect(() => {
-    calPhaseRef.current = calPhase;
-  }, [calPhase]);
+    recordingPhaseRef.current = recordingPhase;
+  }, [recordingPhase]);
 
   // Singletons.
   useEffect(() => {
@@ -96,18 +101,12 @@ export default function Home() {
     let cancelled = false;
     setClassifierState({ kind: "loading" });
 
-    const calibrated = CalibratedClassifier.loadFromStorage();
-    if (calibrated) {
-      const raw = localStorage.getItem("asl-translator:calibration:v1");
-      let counts: Record<string, number> = {};
-      try {
-        const parsed = raw ? JSON.parse(raw) : null;
-        counts = parsed?.sampleCounts ?? {};
-      } catch {
-        /* ignore */
-      }
-      classifierRef.current = calibrated;
-      setClassifierState({ kind: "calibrated", cls: calibrated, sampleCounts: counts });
+    const data = CalibratedClassifier.loadDataFromStorage();
+    setCalibrationData(data);
+    if (data && Object.keys(data.prototypes).length > 0) {
+      const cls = CalibratedClassifier.fromData(data);
+      classifierRef.current = cls;
+      setClassifierState({ kind: "calibrated", cls, sampleCounts: data.sampleCounts });
       return;
     }
 
@@ -121,7 +120,7 @@ export default function Home() {
           return;
         }
         classifierRef.current = cls;
-        setClassifierState({ kind: "trained", cls, calibrated: false });
+        setClassifierState({ kind: "trained", cls });
       })
       .catch((err: unknown) => {
         if (!cancelled) {
@@ -136,51 +135,63 @@ export default function Home() {
     };
   }, [started]);
 
-  // Calibration: schedule the preview→recording transition.
+  // Recording phase machine: idle → (Record click) → preview → recording → saved → idle (back to grid).
   useEffect(() => {
-    if (mode !== "calibrate" || calPhase !== "preview") return;
-    const t = setTimeout(() => {
-      setCalRecordedCount(0);
-      setCalPhase("recording");
-    }, PREVIEW_MS);
-    return () => clearTimeout(t);
-  }, [mode, calPhase, calIdx]);
-
-  const advanceCalibration = useCallback(() => {
-    if (calIdxRef.current + 1 >= ALPHABET.length) {
-      setCalPhase("complete");
-      return;
+    if (mode !== "calibrate" || recordingLetter === null) return;
+    if (recordingPhase === "preview") {
+      const t = setTimeout(() => {
+        recorderRef.current = new LetterRecorder(recordingLetter);
+        setRecordedCount(0);
+        setRecordingPhase("recording");
+      }, PREVIEW_MS);
+      return () => clearTimeout(t);
     }
-    setCalIdx((i) => i + 1);
-    setCalPhase("preview");
-    setCalRecordedCount(0);
-  }, []);
+    if (recordingPhase === "saved") {
+      const t = setTimeout(() => {
+        setRecordingLetter(null);
+        setRecordingPhase("idle");
+      }, SAVED_FLASH_MS);
+      return () => clearTimeout(t);
+    }
+  }, [mode, recordingPhase, recordingLetter]);
 
   const onFrame = useCallback(async (result: FrameResult) => {
-    // CALIBRATION PATH
+    // CALIBRATION RECORDING
     if (modeRef.current === "calibrate") {
-      if (calPhaseRef.current !== "recording") return;
+      if (recordingPhaseRef.current !== "recording") return;
+      const letter = recordingLetterRef.current;
+      const recorder = recorderRef.current;
+      if (!letter || !recorder) return;
       if (result.hands.length === 0) return;
-      const session = calSessionRef.current;
-      if (!session) return;
       const hand = pickPrimaryHand(result.hands);
       const norm = normalizeHand(hand.landmarks, hand.handedness);
-      const letter = ALPHABET[calIdxRef.current];
-      session.push(letter, norm);
-      const count = session.recordedCount(letter);
-      setCalRecordedCount(count);
+      recorder.push(norm);
+      const count = recorder.count;
+      setRecordedCount(count);
       if (count >= CALIBRATION_FRAMES_PER_LETTER) {
-        advanceCalibration();
+        const proto = recorder.buildPrototype();
+        if (proto) {
+          const updated = CalibratedClassifier.upsertLetter(letter, proto, count);
+          setCalibrationData(updated);
+          const cls = CalibratedClassifier.fromData(updated);
+          classifierRef.current = cls;
+          setClassifierState({
+            kind: "calibrated",
+            cls,
+            sampleCounts: updated.sampleCounts,
+          });
+        }
+        recorderRef.current = null;
+        setRecordingPhase("saved");
       }
       return;
     }
 
-    // TRANSLATION PATH
+    // TRANSLATION
     const buf = bufferRef.current;
     const smoother = smootherRef.current;
     if (!buf || !smoother) return;
     const cls = classifierRef.current;
-
     if (!cls || result.hands.length === 0) {
       buf.feed(smoother.push(null), result.timestampMs);
       return;
@@ -195,57 +206,66 @@ export default function Home() {
     } finally {
       inflightRef.current = false;
     }
-  }, [advanceCalibration]);
+  }, []);
 
-  const startCalibration = () => {
-    calSessionRef.current = new CalibrationSession(ALPHABET);
-    setCalIdx(0);
-    setCalPhase("preview");
-    setCalRecordedCount(0);
-    setMode("calibrate");
+  const enterCalibration = () => {
     bufferRef.current?.clear();
     smootherRef.current?.reset();
+    ttsRef.current?.cancel();
+    setMode("calibrate");
+    setRecordingLetter(null);
+    setRecordingPhase("idle");
   };
 
-  const cancelCalibration = () => {
-    calSessionRef.current = null;
+  const exitCalibration = () => {
     setMode("translate");
+    setRecordingLetter(null);
+    setRecordingPhase("idle");
+    recorderRef.current = null;
   };
 
-  const finishCalibration = () => {
-    const session = calSessionRef.current;
-    if (!session) {
-      setMode("translate");
-      return;
-    }
-    const data = session.build();
-    if (Object.keys(data.prototypes).length === 0) {
-      setMode("translate");
-      return;
-    }
-    CalibratedClassifier.saveToStorage(data);
-    const cls = CalibratedClassifier.fromData(data);
-    classifierRef.current = cls;
-    setClassifierState({ kind: "calibrated", cls, sampleCounts: data.sampleCounts });
-    calSessionRef.current = null;
-    setMode("translate");
+  const pickLetterToRecord = (letter: string) => {
+    setRecordingLetter(letter);
+    setRecordingPhase("idle");
+    setRecordedCount(0);
   };
 
-  const clearCalibration = () => {
+  const startRecordingClicked = () => {
+    setRecordingPhase("preview");
+  };
+
+  const cancelRecording = () => {
+    recorderRef.current = null;
+    setRecordingLetter(null);
+    setRecordingPhase("idle");
+    setRecordedCount(0);
+  };
+
+  const clearLetter = (letter: string) => {
+    const updated = CalibratedClassifier.removeLetter(letter);
+    setCalibrationData(updated);
+    if (updated && Object.keys(updated.prototypes).length > 0) {
+      const cls = CalibratedClassifier.fromData(updated);
+      classifierRef.current = cls;
+      setClassifierState({
+        kind: "calibrated",
+        cls,
+        sampleCounts: updated.sampleCounts,
+      });
+    } else {
+      // No more prototypes → fall back to trained model on next camera start.
+      CalibratedClassifier.clearStorage();
+      setCalibrationData(null);
+      setStarted(false);
+      setTimeout(() => setStarted(true), 0);
+    }
+  };
+
+  const clearAllCalibration = () => {
     CalibratedClassifier.clearStorage();
-    setStarted(false); // forces classifier reload via the started effect
+    setCalibrationData(null);
+    setStarted(false);
     setTimeout(() => setStarted(true), 0);
-  };
-
-  const skipLetter = () => {
-    calSessionRef.current?.reset(ALPHABET[calIdxRef.current]);
-    advanceCalibration();
-  };
-
-  const retryLetter = () => {
-    calSessionRef.current?.reset(ALPHABET[calIdxRef.current]);
-    setCalRecordedCount(0);
-    setCalPhase("preview");
   };
 
   const handleClear = () => {
@@ -259,12 +279,8 @@ export default function Home() {
     bufferRef.current?.feed(null, performance.now() + 10_000);
   };
 
-  const recordedLetters = useMemo(
-    () => calSessionRef.current?.recordedLetters().length ?? 0,
-    // Re-read whenever calIdx or phase changes — covers all the relevant moments.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [calIdx, calPhase],
-  );
+  const calibratedLetters = new Set(Object.keys(calibrationData?.prototypes ?? {}));
+  const sampleCounts = calibrationData?.sampleCounts ?? {};
 
   return (
     <main className="flex flex-1 w-full mx-auto max-w-5xl flex-col gap-6 p-6">
@@ -288,15 +304,17 @@ export default function Home() {
             {mode === "calibrate" && (
               <CalibrationOverlay
                 letters={ALPHABET}
-                index={calIdx}
-                phase={calPhase}
-                recordedCount={calRecordedCount}
+                calibratedLetters={calibratedLetters}
+                sampleCounts={sampleCounts}
+                recordingLetter={recordingLetter}
+                recordingPhase={recordingPhase}
+                recordedCount={recordedCount}
                 framesPerLetter={CALIBRATION_FRAMES_PER_LETTER}
-                recordedLetters={recordedLetters}
-                onSkip={skipLetter}
-                onRetry={retryLetter}
-                onCancel={cancelCalibration}
-                onFinish={finishCalibration}
+                onPickLetter={pickLetterToRecord}
+                onStartRecording={startRecordingClicked}
+                onCancelRecording={cancelRecording}
+                onClearLetter={clearLetter}
+                onClose={exitCalibration}
               />
             )}
           </>
@@ -317,8 +335,8 @@ export default function Home() {
         state={classifierState}
         started={started}
         mode={mode}
-        onCalibrate={startCalibration}
-        onClearCalibration={clearCalibration}
+        onCalibrate={enterCalibration}
+        onClearCalibration={clearAllCalibration}
       />
 
       <section className="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -411,7 +429,9 @@ function ClassifierBanner({
   if (!started) return null;
   if (mode === "calibrate") {
     return (
-      <div className="text-xs text-cyan-300">Calibration in progress — stay still and follow the prompts.</div>
+      <div className="text-xs text-cyan-300">
+        Calibration mode — pick any letter to record or recalibrate it.
+      </div>
     );
   }
   if (state.kind === "loading") {
@@ -424,12 +444,22 @@ function ClassifierBanner({
     const letterCount = Object.keys(state.sampleCounts).length;
     return (
       <div className="flex flex-wrap items-center gap-3 text-xs text-zinc-400">
-        <span className="text-emerald-300">Using your personal calibration ({letterCount} letters).</span>
-        <button type="button" onClick={onCalibrate} className="text-cyan-300 hover:text-cyan-200 underline-offset-2 hover:underline">
-          Recalibrate
+        <span className="text-emerald-300">
+          Using your personal calibration ({letterCount} letter{letterCount === 1 ? "" : "s"}).
+        </span>
+        <button
+          type="button"
+          onClick={onCalibrate}
+          className="text-cyan-300 hover:text-cyan-200 underline-offset-2 hover:underline"
+        >
+          Open calibration
         </button>
-        <button type="button" onClick={onClearCalibration} className="text-zinc-500 hover:text-zinc-300 underline-offset-2 hover:underline">
-          Use trained model instead
+        <button
+          type="button"
+          onClick={onClearCalibration}
+          className="text-zinc-500 hover:text-zinc-300 underline-offset-2 hover:underline"
+        >
+          Clear all
         </button>
       </div>
     );
@@ -437,7 +467,11 @@ function ClassifierBanner({
   return (
     <div className="flex flex-wrap items-center gap-3 text-xs text-zinc-400">
       <span>Using the trained model. Accuracy varies by hand & lighting.</span>
-      <button type="button" onClick={onCalibrate} className="text-cyan-300 hover:text-cyan-200 underline-offset-2 hover:underline">
+      <button
+        type="button"
+        onClick={onCalibrate}
+        className="text-cyan-300 hover:text-cyan-200 underline-offset-2 hover:underline"
+      >
         Calibrate to your hand
       </button>
     </div>
@@ -457,7 +491,10 @@ function ConfidenceBar({ value }: { value: number }) {
   const pct = Math.round(Math.max(0, Math.min(1, value)) * 100);
   return (
     <div className="h-1 rounded bg-zinc-800 overflow-hidden mt-2">
-      <div className={pct >= 70 ? "h-full bg-emerald-500" : "h-full bg-amber-500"} style={{ width: `${pct}%` }} />
+      <div
+        className={pct >= 70 ? "h-full bg-emerald-500" : "h-full bg-amber-500"}
+        style={{ width: `${pct}%` }}
+      />
     </div>
   );
 }

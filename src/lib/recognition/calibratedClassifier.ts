@@ -14,57 +14,34 @@ export interface CalibrationData {
 }
 
 /**
- * Mutable session that collects frames letter-by-letter, then exports a
- * `CalibrationData` record. The calling UI drives the letter sequence.
+ * Single-letter recording buffer. The UI uses one of these per letter and
+ * commits via `CalibratedClassifier.upsertLetter` when capture is done.
  */
-export class CalibrationSession {
-  private buffers = new Map<string, Float32Array[]>();
+export class LetterRecorder {
+  private frames: Float32Array[] = [];
 
-  constructor(public readonly letters: readonly string[]) {}
+  constructor(public readonly letter: string) {}
 
-  recordedCount(letter: string): number {
-    return this.buffers.get(letter)?.length ?? 0;
+  push(hand: NormalizedHand): void {
+    this.frames.push(hand.vector);
   }
 
-  push(letter: string, hand: NormalizedHand): void {
-    let arr = this.buffers.get(letter);
-    if (!arr) {
-      arr = [];
-      this.buffers.set(letter, arr);
+  get count(): number {
+    return this.frames.length;
+  }
+
+  reset(): void {
+    this.frames = [];
+  }
+
+  buildPrototype(): number[] | null {
+    if (this.frames.length === 0) return null;
+    const mean = new Float32Array(63);
+    for (const v of this.frames) {
+      for (let i = 0; i < 63; i++) mean[i] += v[i];
     }
-    arr.push(hand.vector);
-  }
-
-  /** Drop everything collected for this letter — used by a "Retry" button. */
-  reset(letter: string): void {
-    this.buffers.delete(letter);
-  }
-
-  /** Letters that have at least one recorded frame. */
-  recordedLetters(): string[] {
-    return [...this.buffers.keys()].filter((k) => (this.buffers.get(k)?.length ?? 0) > 0);
-  }
-
-  /** Build the persistable artifact. Letters with zero frames are excluded. */
-  build(): CalibrationData {
-    const prototypes: Record<string, number[]> = {};
-    const sampleCounts: Record<string, number> = {};
-    for (const [letter, frames] of this.buffers) {
-      if (frames.length === 0) continue;
-      const mean = new Float32Array(63);
-      for (const v of frames) {
-        for (let i = 0; i < 63; i++) mean[i] += v[i];
-      }
-      for (let i = 0; i < 63; i++) mean[i] /= frames.length;
-      prototypes[letter] = Array.from(mean);
-      sampleCounts[letter] = frames.length;
-    }
-    return {
-      version: 1,
-      createdAt: Date.now(),
-      prototypes,
-      sampleCounts,
-    };
+    for (let i = 0; i < 63; i++) mean[i] /= this.frames.length;
+    return Array.from(mean);
   }
 }
 
@@ -92,23 +69,63 @@ export class CalibratedClassifier {
     return new CalibratedClassifier(labels, prototypes);
   }
 
-  static loadFromStorage(): CalibratedClassifier | null {
+  static loadDataFromStorage(): CalibrationData | null {
     if (typeof localStorage === "undefined") return null;
     const raw = localStorage.getItem(CALIBRATION_STORAGE_KEY);
     if (!raw) return null;
     try {
       const data = JSON.parse(raw) as CalibrationData;
       if (data.version !== 1 || !data.prototypes) return null;
-      if (Object.keys(data.prototypes).length === 0) return null;
-      return CalibratedClassifier.fromData(data);
+      return data;
     } catch {
       return null;
     }
   }
 
+  static loadFromStorage(): CalibratedClassifier | null {
+    const data = CalibratedClassifier.loadDataFromStorage();
+    if (!data || Object.keys(data.prototypes).length === 0) return null;
+    return CalibratedClassifier.fromData(data);
+  }
+
   static saveToStorage(data: CalibrationData): void {
     if (typeof localStorage === "undefined") return;
     localStorage.setItem(CALIBRATION_STORAGE_KEY, JSON.stringify(data));
+  }
+
+  /**
+   * Add or replace a single letter's prototype, persisting immediately.
+   * Used by the manual per-letter calibration UI so that any letter can be
+   * recalibrated without losing the others.
+   */
+  static upsertLetter(
+    letter: string,
+    prototype: number[],
+    sampleCount: number,
+  ): CalibrationData {
+    const existing = CalibratedClassifier.loadDataFromStorage();
+    const data: CalibrationData =
+      existing ?? {
+        version: 1,
+        createdAt: Date.now(),
+        prototypes: {},
+        sampleCounts: {},
+      };
+    data.prototypes[letter] = prototype;
+    data.sampleCounts[letter] = sampleCount;
+    data.createdAt = Date.now();
+    CalibratedClassifier.saveToStorage(data);
+    return data;
+  }
+
+  static removeLetter(letter: string): CalibrationData | null {
+    const data = CalibratedClassifier.loadDataFromStorage();
+    if (!data) return null;
+    delete data.prototypes[letter];
+    delete data.sampleCounts[letter];
+    data.createdAt = Date.now();
+    CalibratedClassifier.saveToStorage(data);
+    return data;
   }
 
   static clearStorage(): void {

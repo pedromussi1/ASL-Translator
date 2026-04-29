@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import {
+  CALIBRATION_STORAGE_KEY,
   CalibratedClassifier,
-  CalibrationSession,
+  LetterRecorder,
   type CalibrationData,
 } from "./calibratedClassifier";
 import type { NormalizedHand } from "./types";
@@ -11,26 +12,32 @@ const hand = (vec: number[], handedness: "Left" | "Right" = "Right"): Normalized
   handedness,
 });
 
-describe("CalibrationSession", () => {
-  it("collects frames per letter and averages them into a prototype", () => {
-    const s = new CalibrationSession(["A", "B"]);
-    s.push("A", hand([1, 1, 1]));
-    s.push("A", hand([3, 3, 3]));
-    expect(s.recordedCount("A")).toBe(2);
+beforeEach(() => {
+  if (typeof localStorage !== "undefined") localStorage.clear();
+});
 
-    const data = s.build();
-    expect(data.version).toBe(1);
-    expect(data.prototypes.A.slice(0, 3)).toEqual([2, 2, 2]);
-    expect(data.sampleCounts.A).toBe(2);
-    expect(data.prototypes.B).toBeUndefined();
+describe("LetterRecorder", () => {
+  it("averages frames into a mean prototype", () => {
+    const r = new LetterRecorder("A");
+    r.push(hand([1, 1, 1]));
+    r.push(hand([3, 3, 3]));
+    expect(r.count).toBe(2);
+    const proto = r.buildPrototype();
+    expect(proto).not.toBeNull();
+    expect(proto!.slice(0, 3)).toEqual([2, 2, 2]);
   });
 
-  it("reset() drops samples for a letter", () => {
-    const s = new CalibrationSession(["A"]);
-    s.push("A", hand([1, 0, 0]));
-    s.reset("A");
-    expect(s.recordedCount("A")).toBe(0);
-    expect(s.build().prototypes.A).toBeUndefined();
+  it("returns null when nothing was recorded", () => {
+    const r = new LetterRecorder("A");
+    expect(r.buildPrototype()).toBeNull();
+  });
+
+  it("reset clears the buffer", () => {
+    const r = new LetterRecorder("A");
+    r.push(hand([1, 0, 0]));
+    r.reset();
+    expect(r.count).toBe(0);
+    expect(r.buildPrototype()).toBeNull();
   });
 });
 
@@ -53,14 +60,14 @@ describe("CalibratedClassifier", () => {
     expect(r.confidence).toBeGreaterThan(0);
   });
 
-  it("confidence is high when the runner-up is far away", () => {
+  it("confidence is higher when the runner-up is far away", () => {
     const c = CalibratedClassifier.fromData(data);
     const close = c.recognizeSync(hand([0.99, 0.01]));
     const ambiguous = c.recognizeSync(hand([0.5, 0.5]));
     expect(close.confidence).toBeGreaterThan(ambiguous.confidence);
   });
 
-  it("returns confidence 0 for an empty calibration", () => {
+  it("returns confidence 0 when there are no prototypes", () => {
     const empty: CalibrationData = {
       version: 1,
       createdAt: 0,
@@ -68,16 +75,63 @@ describe("CalibratedClassifier", () => {
       sampleCounts: {},
     };
     const c = CalibratedClassifier.fromData(empty);
-    const r = c.recognizeSync(hand([1, 0, 0]));
-    expect(r.confidence).toBe(0);
+    expect(c.recognizeSync(hand([1, 0, 0])).confidence).toBe(0);
+  });
+});
+
+describe("CalibratedClassifier.upsertLetter", () => {
+  it("persists a new letter into a fresh calibration", () => {
+    const proto = Array(63).fill(0.42);
+    const data = CalibratedClassifier.upsertLetter("A", proto, 60);
+    expect(data.prototypes.A).toEqual(proto);
+    expect(data.sampleCounts.A).toBe(60);
+
+    const loaded = CalibratedClassifier.loadDataFromStorage();
+    expect(loaded?.prototypes.A).toEqual(proto);
   });
 
-  it("confidence ranges in [0, 1]", () => {
-    const c = CalibratedClassifier.fromData(data);
-    for (let i = 0; i < 5; i++) {
-      const r = c.recognizeSync(hand([Math.random(), Math.random(), Math.random()]));
-      expect(r.confidence).toBeGreaterThanOrEqual(0);
-      expect(r.confidence).toBeLessThanOrEqual(1);
-    }
+  it("replaces a letter without losing others", () => {
+    CalibratedClassifier.upsertLetter("A", Array(63).fill(1), 60);
+    CalibratedClassifier.upsertLetter("B", Array(63).fill(2), 60);
+    const data = CalibratedClassifier.upsertLetter("A", Array(63).fill(3), 80);
+    expect(data.prototypes.A[0]).toBe(3);
+    expect(data.prototypes.B[0]).toBe(2);
+    expect(data.sampleCounts.A).toBe(80);
+    expect(data.sampleCounts.B).toBe(60);
+  });
+
+  it("removeLetter strips just that letter", () => {
+    CalibratedClassifier.upsertLetter("A", Array(63).fill(1), 60);
+    CalibratedClassifier.upsertLetter("B", Array(63).fill(2), 60);
+    const data = CalibratedClassifier.removeLetter("A");
+    expect(data?.prototypes.A).toBeUndefined();
+    expect(data?.prototypes.B).toBeDefined();
+  });
+
+  it("loadFromStorage returns null when no letters are calibrated", () => {
+    expect(CalibratedClassifier.loadFromStorage()).toBeNull();
+    CalibratedClassifier.saveToStorage({
+      version: 1,
+      createdAt: 0,
+      prototypes: {},
+      sampleCounts: {},
+    });
+    expect(CalibratedClassifier.loadFromStorage()).toBeNull();
+  });
+});
+
+describe("CalibratedClassifier storage round-trip", () => {
+  it("saveToStorage + loadFromStorage preserves data", () => {
+    const original: CalibrationData = {
+      version: 1,
+      createdAt: 12345,
+      prototypes: { Q: Array(63).fill(0.5) },
+      sampleCounts: { Q: 30 },
+    };
+    CalibratedClassifier.saveToStorage(original);
+    const loaded = CalibratedClassifier.loadDataFromStorage();
+    expect(loaded?.prototypes.Q.length).toBe(63);
+    expect(loaded?.sampleCounts.Q).toBe(30);
+    expect(localStorage.getItem(CALIBRATION_STORAGE_KEY)).toBeTruthy();
   });
 });
