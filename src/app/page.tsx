@@ -1,17 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  CalibrationOverlay,
-  type RecordingPhase,
-} from "@/components/CalibrationOverlay";
 import { CameraView, type CameraStatus } from "@/components/CameraView";
-import {
-  CALIBRATION_FRAMES_PER_LETTER,
-  CalibratedClassifier,
-  LetterRecorder,
-  type CalibrationData,
-} from "@/lib/recognition/calibratedClassifier";
 import { AlphabetClassifier } from "@/lib/recognition/classifier";
 import { normalizeHand } from "@/lib/recognition/normalize";
 import { PredictionSmoother } from "@/lib/recognition/smoother";
@@ -19,16 +9,9 @@ import type { DetectedHand, FrameResult, Prediction } from "@/lib/recognition/ty
 import { WordBuffer } from "@/lib/recognition/wordBuffer";
 import { WebSpeechProvider } from "@/lib/tts/webSpeech";
 
-const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
-const PREVIEW_MS = 1200; // "Get ready…" before recording starts on Record click
-const SAVED_FLASH_MS = 700; // how long to show "Saved ✓" before returning to grid
-
-type Mode = "translate" | "calibrate";
-
 type ClassifierState =
   | { kind: "loading" }
-  | { kind: "trained"; cls: AlphabetClassifier }
-  | { kind: "calibrated"; cls: CalibratedClassifier; sampleCounts: Record<string, number> }
+  | { kind: "ready" }
   | { kind: "error"; message: string };
 
 export default function Home() {
@@ -42,35 +25,13 @@ export default function Home() {
     conf: 0,
   });
 
-  const [mode, setMode] = useState<Mode>("translate");
-  const [calibrationData, setCalibrationData] = useState<CalibrationData | null>(null);
-  const [recordingLetter, setRecordingLetter] = useState<string | null>(null);
-  const [recordingPhase, setRecordingPhase] = useState<RecordingPhase>("idle");
-  const [recordedCount, setRecordedCount] = useState(0);
-
+  const classifierRef = useRef<AlphabetClassifier | null>(null);
   const smootherRef = useRef<PredictionSmoother | null>(null);
   const bufferRef = useRef<WordBuffer | null>(null);
   const ttsRef = useRef<WebSpeechProvider | null>(null);
   const inflightRef = useRef(false);
-  const classifierRef = useRef<AlphabetClassifier | CalibratedClassifier | null>(null);
-  const recorderRef = useRef<LetterRecorder | null>(null);
 
-  // Refs that mirror state for the async onFrame closure.
-  const modeRef = useRef<Mode>("translate");
-  const recordingLetterRef = useRef<string | null>(null);
-  const recordingPhaseRef = useRef<RecordingPhase>("idle");
-
-  useEffect(() => {
-    modeRef.current = mode;
-  }, [mode]);
-  useEffect(() => {
-    recordingLetterRef.current = recordingLetter;
-  }, [recordingLetter]);
-  useEffect(() => {
-    recordingPhaseRef.current = recordingPhase;
-  }, [recordingPhase]);
-
-  // Singletons.
+  // Initialize the singletons once.
   useEffect(() => {
     bufferRef.current = new WordBuffer();
     smootherRef.current = new PredictionSmoother(5);
@@ -95,32 +56,22 @@ export default function Home() {
     };
   }, []);
 
-  // Choose / load the active classifier when the camera starts.
+  // Lazy-load the classifier when the user starts the camera.
   useEffect(() => {
     if (!started) return;
     let cancelled = false;
     setClassifierState({ kind: "loading" });
-
-    const data = CalibratedClassifier.loadDataFromStorage();
-    setCalibrationData(data);
-    if (data && Object.keys(data.prototypes).length > 0) {
-      const cls = CalibratedClassifier.fromData(data);
-      classifierRef.current = cls;
-      setClassifierState({ kind: "calibrated", cls, sampleCounts: data.sampleCounts });
-      return;
-    }
-
     AlphabetClassifier.load({
       modelUrl: "/models/asl_alphabet_v1/alphabet.onnx",
       labelsUrl: "/models/asl_alphabet_v1/labels.json",
     })
-      .then((cls) => {
+      .then((c) => {
         if (cancelled) {
-          cls.close();
+          c.close();
           return;
         }
-        classifierRef.current = cls;
-        setClassifierState({ kind: "trained", cls });
+        classifierRef.current = c;
+        setClassifierState({ kind: "ready" });
       })
       .catch((err: unknown) => {
         if (!cancelled) {
@@ -132,70 +83,22 @@ export default function Home() {
       });
     return () => {
       cancelled = true;
+      classifierRef.current?.close();
+      classifierRef.current = null;
     };
   }, [started]);
 
-  // Recording phase machine: idle → (Record click) → preview → recording → saved → idle (back to grid).
-  useEffect(() => {
-    if (mode !== "calibrate" || recordingLetter === null) return;
-    if (recordingPhase === "preview") {
-      const t = setTimeout(() => {
-        recorderRef.current = new LetterRecorder(recordingLetter);
-        setRecordedCount(0);
-        setRecordingPhase("recording");
-      }, PREVIEW_MS);
-      return () => clearTimeout(t);
-    }
-    if (recordingPhase === "saved") {
-      const t = setTimeout(() => {
-        setRecordingLetter(null);
-        setRecordingPhase("idle");
-      }, SAVED_FLASH_MS);
-      return () => clearTimeout(t);
-    }
-  }, [mode, recordingPhase, recordingLetter]);
-
   const onFrame = useCallback(async (result: FrameResult) => {
-    // CALIBRATION RECORDING
-    if (modeRef.current === "calibrate") {
-      if (recordingPhaseRef.current !== "recording") return;
-      const letter = recordingLetterRef.current;
-      const recorder = recorderRef.current;
-      if (!letter || !recorder) return;
-      if (result.hands.length === 0) return;
-      const hand = pickPrimaryHand(result.hands);
-      const norm = normalizeHand(hand.landmarks, hand.handedness);
-      recorder.push(norm);
-      const count = recorder.count;
-      setRecordedCount(count);
-      if (count >= CALIBRATION_FRAMES_PER_LETTER) {
-        const proto = recorder.buildPrototype();
-        if (proto) {
-          const updated = CalibratedClassifier.upsertLetter(letter, proto, count);
-          setCalibrationData(updated);
-          const cls = CalibratedClassifier.fromData(updated);
-          classifierRef.current = cls;
-          setClassifierState({
-            kind: "calibrated",
-            cls,
-            sampleCounts: updated.sampleCounts,
-          });
-        }
-        recorderRef.current = null;
-        setRecordingPhase("saved");
-      }
-      return;
-    }
-
-    // TRANSLATION
     const buf = bufferRef.current;
     const smoother = smootherRef.current;
-    if (!buf || !smoother) return;
     const cls = classifierRef.current;
+    if (!buf || !smoother) return;
     if (!cls || result.hands.length === 0) {
       buf.feed(smoother.push(null), result.timestampMs);
       return;
     }
+    // Skip the frame if a previous recognition is still in flight to avoid
+    // backpressure.
     if (inflightRef.current) return;
     inflightRef.current = true;
     try {
@@ -208,66 +111,6 @@ export default function Home() {
     }
   }, []);
 
-  const enterCalibration = () => {
-    bufferRef.current?.clear();
-    smootherRef.current?.reset();
-    ttsRef.current?.cancel();
-    setMode("calibrate");
-    setRecordingLetter(null);
-    setRecordingPhase("idle");
-  };
-
-  const exitCalibration = () => {
-    setMode("translate");
-    setRecordingLetter(null);
-    setRecordingPhase("idle");
-    recorderRef.current = null;
-  };
-
-  const pickLetterToRecord = (letter: string) => {
-    setRecordingLetter(letter);
-    setRecordingPhase("idle");
-    setRecordedCount(0);
-  };
-
-  const startRecordingClicked = () => {
-    setRecordingPhase("preview");
-  };
-
-  const cancelRecording = () => {
-    recorderRef.current = null;
-    setRecordingLetter(null);
-    setRecordingPhase("idle");
-    setRecordedCount(0);
-  };
-
-  const clearLetter = (letter: string) => {
-    const updated = CalibratedClassifier.removeLetter(letter);
-    setCalibrationData(updated);
-    if (updated && Object.keys(updated.prototypes).length > 0) {
-      const cls = CalibratedClassifier.fromData(updated);
-      classifierRef.current = cls;
-      setClassifierState({
-        kind: "calibrated",
-        cls,
-        sampleCounts: updated.sampleCounts,
-      });
-    } else {
-      // No more prototypes → fall back to trained model on next camera start.
-      CalibratedClassifier.clearStorage();
-      setCalibrationData(null);
-      setStarted(false);
-      setTimeout(() => setStarted(true), 0);
-    }
-  };
-
-  const clearAllCalibration = () => {
-    CalibratedClassifier.clearStorage();
-    setCalibrationData(null);
-    setStarted(false);
-    setTimeout(() => setStarted(true), 0);
-  };
-
   const handleClear = () => {
     bufferRef.current?.clear();
     smootherRef.current?.reset();
@@ -276,11 +119,9 @@ export default function Home() {
   };
 
   const handleSpace = () => {
+    // Force-end the current word.
     bufferRef.current?.feed(null, performance.now() + 10_000);
   };
-
-  const calibratedLetters = new Set(Object.keys(calibrationData?.prototypes ?? {}));
-  const sampleCounts = calibrationData?.sampleCounts ?? {};
 
   return (
     <main className="flex flex-1 w-full mx-auto max-w-5xl flex-col gap-6 p-6">
@@ -297,27 +138,9 @@ export default function Home() {
         — no frames leave your device.
       </p>
 
-      <section className="rounded-xl overflow-hidden bg-zinc-900 border border-zinc-800 shadow-lg relative">
+      <section className="rounded-xl overflow-hidden bg-zinc-900 border border-zinc-800 shadow-lg">
         {started ? (
-          <>
-            <CameraView onStatusChange={setStatus} onFrame={onFrame} className="aspect-video" />
-            {mode === "calibrate" && (
-              <CalibrationOverlay
-                letters={ALPHABET}
-                calibratedLetters={calibratedLetters}
-                sampleCounts={sampleCounts}
-                recordingLetter={recordingLetter}
-                recordingPhase={recordingPhase}
-                recordedCount={recordedCount}
-                framesPerLetter={CALIBRATION_FRAMES_PER_LETTER}
-                onPickLetter={pickLetterToRecord}
-                onStartRecording={startRecordingClicked}
-                onCancelRecording={cancelRecording}
-                onClearLetter={clearLetter}
-                onClose={exitCalibration}
-              />
-            )}
-          </>
+          <CameraView onStatusChange={setStatus} onFrame={onFrame} className="aspect-video" />
         ) : (
           <div className="aspect-video flex items-center justify-center">
             <button
@@ -331,13 +154,7 @@ export default function Home() {
         )}
       </section>
 
-      <ClassifierBanner
-        state={classifierState}
-        started={started}
-        mode={mode}
-        onCalibrate={enterCalibration}
-        onClearCalibration={clearAllCalibration}
-      />
+      <ModelBanner state={classifierState} started={started} />
 
       <section className="grid grid-cols-1 sm:grid-cols-3 gap-4">
         <Stat label="Detecting">
@@ -358,9 +175,7 @@ export default function Home() {
 
         <Stat label="Transcript">
           <span className="text-sm font-mono text-zinc-300 leading-relaxed break-words">
-            {transcript.length > 0 ? (
-              transcript.join(" ")
-            ) : (
+            {transcript.length > 0 ? transcript.join(" ") : (
               <span className="text-zinc-600">nothing yet</span>
             )}
           </span>
@@ -394,6 +209,7 @@ export default function Home() {
 }
 
 function pickPrimaryHand(hands: DetectedHand[]): DetectedHand {
+  // Pick the hand with the largest bounding-box area on screen.
   let best = hands[0];
   let bestArea = 0;
   for (const h of hands) {
@@ -413,67 +229,19 @@ function pickPrimaryHand(hands: DetectedHand[]): DetectedHand {
   return best;
 }
 
-function ClassifierBanner({
-  state,
-  started,
-  mode,
-  onCalibrate,
-  onClearCalibration,
-}: {
-  state: ClassifierState;
-  started: boolean;
-  mode: Mode;
-  onCalibrate: () => void;
-  onClearCalibration: () => void;
-}) {
+function ModelBanner({ state, started }: { state: ClassifierState; started: boolean }) {
   if (!started) return null;
-  if (mode === "calibrate") {
-    return (
-      <div className="text-xs text-cyan-300">
-        Calibration mode — pick any letter to record or recalibrate it.
-      </div>
-    );
-  }
   if (state.kind === "loading") {
     return <div className="text-xs text-amber-300">Loading classifier…</div>;
   }
   if (state.kind === "error") {
     return <div className="text-xs text-rose-400">Classifier failed: {state.message}</div>;
   }
-  if (state.kind === "calibrated") {
-    const letterCount = Object.keys(state.sampleCounts).length;
-    return (
-      <div className="flex flex-wrap items-center gap-3 text-xs text-zinc-400">
-        <span className="text-emerald-300">
-          Using your personal calibration ({letterCount} letter{letterCount === 1 ? "" : "s"}).
-        </span>
-        <button
-          type="button"
-          onClick={onCalibrate}
-          className="text-cyan-300 hover:text-cyan-200 underline-offset-2 hover:underline"
-        >
-          Open calibration
-        </button>
-        <button
-          type="button"
-          onClick={onClearCalibration}
-          className="text-zinc-500 hover:text-zinc-300 underline-offset-2 hover:underline"
-        >
-          Clear all
-        </button>
-      </div>
-    );
-  }
   return (
-    <div className="flex flex-wrap items-center gap-3 text-xs text-zinc-400">
-      <span>Using the trained model. Accuracy varies by hand & lighting.</span>
-      <button
-        type="button"
-        onClick={onCalibrate}
-        className="text-cyan-300 hover:text-cyan-200 underline-offset-2 hover:underline"
-      >
-        Calibrate to your hand
-      </button>
+    <div className="text-xs text-zinc-500">
+      Using stub classifier (random weights). Run{" "}
+      <code className="font-mono text-zinc-300">python training/train_alphabet.py</code>{" "}
+      for the real model.
     </div>
   );
 }
@@ -521,7 +289,9 @@ function StatusBar({ status }: { status: CameraStatus }) {
       </span>
       <span>
         Hands:{" "}
-        <span className={status.handsDetected > 0 ? "text-emerald-400" : "text-zinc-500"}>
+        <span
+          className={status.handsDetected > 0 ? "text-emerald-400" : "text-zinc-500"}
+        >
           {status.handsDetected}
         </span>
       </span>
