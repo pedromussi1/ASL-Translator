@@ -1,4 +1,4 @@
-import type { DetectedHand, FrameResult, RawHandLandmarks } from "./types";
+import type { DetectedHand, HandsResult, RawHandLandmarks } from "./types";
 
 const WASM_BASE_URL =
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm";
@@ -45,7 +45,7 @@ export class HandLandmarkerEngine {
    * Detect hands in the current video frame. The video element must be playing
    * (readyState >= 2) before calling.
    */
-  detect(video: HTMLVideoElement, timestampMs: number = performance.now()): FrameResult {
+  detect(video: HTMLVideoElement, timestampMs: number = performance.now()): HandsResult {
     if (!this.landmarker) throw new Error("HandLandmarker not initialized.");
     // MediaPipe requires monotonically increasing timestamps.
     if (timestampMs <= this.lastTimestampMs) timestampMs = this.lastTimestampMs + 1;

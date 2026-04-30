@@ -1,4 +1,4 @@
-import type { DetectedHand, Point3 } from "./types";
+import type { DetectedFace, DetectedHand, Point3 } from "./types";
 
 export type DynamicLabel = "J" | "Z" | "YES" | "HELLO" | "THANK YOU";
 
@@ -13,6 +13,7 @@ interface FrameFeatures {
   wrist: Point3;
   indexTip: Point3;
   pinkyTip: Point3;
+  face: DetectedFace | null;
 }
 
 const BUFFER_MS = 1500;
@@ -45,14 +46,18 @@ export class DynamicSignDetector {
   private buffer: FrameFeatures[] = [];
   private cooldownUntil = 0;
 
-  push(hand: DetectedHand | null, timestampMs: number): DynamicResult | null {
+  push(
+    hand: DetectedHand | null,
+    face: DetectedFace | null,
+    timestampMs: number,
+  ): DynamicResult | null {
     // Drop frames with no hand — they break trajectory continuity.
     if (!hand) {
       this.buffer = [];
       return null;
     }
 
-    const features = computeFeatures(hand, timestampMs);
+    const features = computeFeatures(hand, face, timestampMs);
     this.buffer.push(features);
 
     // Evict frames older than BUFFER_MS.
@@ -90,7 +95,11 @@ export class DynamicSignDetector {
 // Feature extraction
 // ---------------------------------------------------------------------------
 
-function computeFeatures(hand: DetectedHand, timestampMs: number): FrameFeatures {
+function computeFeatures(
+  hand: DetectedHand,
+  face: DetectedFace | null,
+  timestampMs: number,
+): FrameFeatures {
   const lms = hand.landmarks;
   return {
     timestampMs,
@@ -104,6 +113,7 @@ function computeFeatures(hand: DetectedHand, timestampMs: number): FrameFeatures
     wrist: lms[0],
     indexTip: lms[8],
     pinkyTip: lms[20],
+    face,
   };
 }
 
@@ -263,42 +273,97 @@ function matchYes(buf: FrameFeatures[]): number {
   return clamp01(shape * 0.4 + oscScore * 0.5 + ampScore * 0.3);
 }
 
-// HELLO — open hand starting near the head, sweeping outward. Without face
-// landmarks we approximate "near head" by requiring the wrist to start in
-// the upper portion of the frame and end further out.
+// HELLO — open hand at the temple, salute-like sweep outward. With face
+// landmarks we anchor "near temple" to the actual ear/eye position rather
+// than guessing from absolute screen y.
 function matchHello(buf: FrameFeatures[], handedness: "Left" | "Right"): number {
   const shape = avgShape(buf, shapeOpenHand);
   if (shape < 0.5) return 0;
 
   const start = buf[0].wrist;
   const end = buf[buf.length - 1].wrist;
-  if (start.y > 0.55) return 0; // wrist must start in upper half
+  const face = buf[0].face;
+
   const mirror = handedness === "Right" ? -1 : 1;
-  const dx = (end.x - start.x) * mirror; // expect outward (+ on the away side)
+  const dx = (end.x - start.x) * mirror;
   if (dx < 0.05) return 0;
 
-  const score = clamp01(dx / 0.18) * clamp01(shape);
-  // Cap below 1 — heuristic for HELLO is intrinsically low-confidence.
-  return Math.min(0.85, score);
+  let proximityScore: number;
+  if (face) {
+    const faceHeight = faceVerticalSize(face);
+    const eyeY =
+      face.rightEye?.y ?? face.leftEye?.y ?? face.noseTip?.y ?? null;
+    const sideEar = handedness === "Right" ? face.rightEar : face.leftEar;
+    const anchorEyeY = eyeY ?? 0.4;
+    const dyToEye = Math.abs(start.y - anchorEyeY);
+    const verticalCloseness = clamp01(1 - dyToEye / Math.max(faceHeight, 0.1));
+    if (verticalCloseness < 0.3) return 0;
+
+    let lateralScore = 0.5;
+    if (sideEar) {
+      // For a right-handed user, the right ear is on the LEFT of the
+      // unmirrored frame. The hand starts at or just outside the same-side ear.
+      const earDelta = (sideEar.x - start.x) * mirror;
+      lateralScore = clamp01(0.5 + earDelta * 4);
+    }
+    proximityScore = verticalCloseness * 0.6 + lateralScore * 0.4;
+  } else {
+    if (start.y > 0.55) return 0;
+    proximityScore = 0.4;
+  }
+
+  const motion = clamp01(dx / 0.18);
+  const score = motion * proximityScore * clamp01(shape);
+  return clamp01(face ? score : Math.min(0.7, score));
 }
 
-// THANK YOU — open hand starts near chin, palm toward signer, moves
-// outward + slightly down. Heuristic: wrist starts upper-center, ends further
-// down/out, palm-face-in approximated by hand z near 0 and not advancing
-// toward camera.
+// THANK YOU — open hand starts at the chin/mouth, palm toward signer, sweeps
+// outward and slightly down. With face landmarks we anchor "near mouth" to
+// the actual mouth keypoint.
 function matchThankYou(buf: FrameFeatures[]): number {
   const shape = avgShape(buf, shapeOpenHand);
   if (shape < 0.5) return 0;
 
   const start = buf[0].wrist;
   const end = buf[buf.length - 1].wrist;
-  if (start.y > 0.5) return 0;
-  if (end.y - start.y < 0.04) return 0; // must move down at least a little
+  const face = buf[0].face;
 
-  const xMove = Math.abs(end.x - start.x);
   const yMove = end.y - start.y;
-  const score = clamp01(yMove / 0.15) * clamp01((yMove + xMove) / 0.2) * clamp01(shape);
-  return Math.min(0.8, score);
+  if (yMove < 0.04) return 0;
+  const xMove = Math.abs(end.x - start.x);
+
+  let proximityScore: number;
+  if (face) {
+    const mouth = face.mouthCenter ?? face.noseTip ?? null;
+    if (!mouth) {
+      proximityScore = 0.4;
+    } else {
+      const faceHeight = faceVerticalSize(face);
+      const dy = Math.abs(start.y - mouth.y);
+      const dx = Math.abs(start.x - mouth.x);
+      proximityScore =
+        clamp01(1 - dy / Math.max(faceHeight, 0.1)) *
+        clamp01(1 - dx / Math.max(faceHeight, 0.1));
+      if (proximityScore < 0.3) return 0;
+    }
+  } else {
+    if (start.y > 0.5) return 0;
+    proximityScore = 0.4;
+  }
+
+  const motion = clamp01(yMove / 0.15) * clamp01((yMove + xMove) / 0.2);
+  const score = motion * proximityScore * clamp01(shape);
+  return clamp01(face ? score : Math.min(0.7, score));
+}
+
+/** Approximate face vertical span in normalized coords using available keypoints. */
+function faceVerticalSize(face: DetectedFace): number {
+  const eyeY = face.rightEye?.y ?? face.leftEye?.y ?? null;
+  const mouthY = face.mouthCenter?.y ?? null;
+  if (eyeY !== null && mouthY !== null) {
+    return Math.max(0.05, Math.abs(mouthY - eyeY) * 2);
+  }
+  return 0.2;
 }
 
 // ---------------------------------------------------------------------------

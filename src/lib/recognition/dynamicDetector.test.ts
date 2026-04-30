@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { DynamicSignDetector } from "./dynamicDetector";
-import type { DetectedHand, Point3 } from "./types";
+import type { DetectedFace, DetectedHand, Point3 } from "./types";
 
 type Shape = "pinkyOut" | "indexOut" | "fist" | "open";
 type Handedness = "Left" | "Right";
@@ -90,7 +90,7 @@ function simulate(
   let last = null;
   let t = startMs;
   for (const f of frames) {
-    const r = detector.push(f, t);
+    const r = detector.push(f, null, t);
     if (r) last = r;
     t += 33; // ~30fps
   }
@@ -233,12 +233,126 @@ describe("DynamicSignDetector — false-positive guards", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// HELLO / THANK YOU — face-anchored
+// ---------------------------------------------------------------------------
+
+const TYPICAL_FACE: DetectedFace = {
+  rightEye: { x: 0.45, y: 0.38 },
+  leftEye: { x: 0.55, y: 0.38 },
+  noseTip: { x: 0.50, y: 0.42 },
+  mouthCenter: { x: 0.50, y: 0.50 },
+  rightEar: { x: 0.40, y: 0.40 },
+  leftEar: { x: 0.60, y: 0.40 },
+};
+
+function simulateWithFace(
+  detector: DynamicSignDetector,
+  frames: DetectedHand[],
+  face: DetectedFace | null,
+): { label: string; confidence: number } | null {
+  let last = null;
+  let t = 0;
+  for (const f of frames) {
+    const r = detector.push(f, face, t);
+    if (r) last = r;
+    t += 33;
+  }
+  return last;
+}
+
+describe("DynamicSignDetector — HELLO (face-anchored)", () => {
+  it("fires when right hand starts at the right ear and sweeps outward", () => {
+    // Right ear is at x=0.40 in unmirrored frame. Right-handed user's hand
+    // starts there and sweeps to the user's right (= further left in
+    // unmirrored landmark coords).
+    const N = 20;
+    const frames: DetectedHand[] = [];
+    for (let i = 0; i < N; i++) {
+      const t = i / (N - 1);
+      const wristX = lerp(0.40, 0.22, t);
+      const wristY = lerp(0.40, 0.42, t);
+      frames.push(
+        mkFrame({
+          shape: "open",
+          wrist: { x: wristX, y: wristY },
+          handedness: "Right",
+        }),
+      );
+    }
+    const r = simulateWithFace(new DynamicSignDetector(), frames, TYPICAL_FACE);
+    expect(r?.label).toBe("HELLO");
+  });
+
+  it("does NOT fire when an open-hand sweep happens far below the head", () => {
+    // Same outward motion but wrist is way below face (waist-level).
+    const N = 20;
+    const frames: DetectedHand[] = [];
+    for (let i = 0; i < N; i++) {
+      const t = i / (N - 1);
+      const wristX = lerp(0.40, 0.22, t);
+      const wristY = 0.85; // far below the face
+      frames.push(
+        mkFrame({
+          shape: "open",
+          wrist: { x: wristX, y: wristY },
+          handedness: "Right",
+        }),
+      );
+    }
+    const r = simulateWithFace(new DynamicSignDetector(), frames, TYPICAL_FACE);
+    expect(r?.label).not.toBe("HELLO");
+  });
+});
+
+describe("DynamicSignDetector — THANK YOU (face-anchored)", () => {
+  it("fires when right hand starts at mouth and moves outward + down", () => {
+    // mouth_center is at (0.50, 0.50). Hand starts there and moves down-right
+    // (signer-outward = our right in unmirrored for right hand → x decreases).
+    const N = 20;
+    const frames: DetectedHand[] = [];
+    for (let i = 0; i < N; i++) {
+      const t = i / (N - 1);
+      const wristX = lerp(0.50, 0.36, t);
+      const wristY = lerp(0.50, 0.65, t);
+      frames.push(
+        mkFrame({
+          shape: "open",
+          wrist: { x: wristX, y: wristY },
+          handedness: "Right",
+        }),
+      );
+    }
+    const r = simulateWithFace(new DynamicSignDetector(), frames, TYPICAL_FACE);
+    expect(r?.label).toBe("THANK YOU");
+  });
+
+  it("does NOT fire when the open-hand sweep starts nowhere near the mouth", () => {
+    const N = 20;
+    const frames: DetectedHand[] = [];
+    for (let i = 0; i < N; i++) {
+      const t = i / (N - 1);
+      const wristX = lerp(0.20, 0.10, t);
+      const wristY = lerp(0.85, 0.95, t);
+      frames.push(
+        mkFrame({
+          shape: "open",
+          wrist: { x: wristX, y: wristY },
+          handedness: "Right",
+        }),
+      );
+    }
+    const r = simulateWithFace(new DynamicSignDetector(), frames, TYPICAL_FACE);
+    expect(r?.label).not.toBe("THANK YOU");
+  });
+});
+
 describe("DynamicSignDetector — buffer/cooldown lifecycle", () => {
   it("resetting the buffer when no hand is visible", () => {
     const detector = new DynamicSignDetector();
-    detector.push(mkFrame({ shape: "pinkyOut" }), 0);
-    detector.push(mkFrame({ shape: "pinkyOut" }), 33);
-    detector.push(null, 66);
+    detector.push(mkFrame({ shape: "pinkyOut" }), null, 0);
+    detector.push(mkFrame({ shape: "pinkyOut" }), null, 33);
+    detector.push(null, null, 66);
     // After null, internal buffer is wiped; subsequent identical static frames
     // should not be treated as having any motion accumulated.
     const stillFrames = Array.from({ length: 20 }, () =>

@@ -103,8 +103,8 @@ export default function Home() {
 
     // Dynamic-sign detector runs first. If it fires, we bypass the letter
     // pipeline — committing whatever's in the word buffer, then appending the
-    // dynamic word and speaking it.
-    const dyn = dynamic.push(hand, result.timestampMs);
+    // dynamic word and speaking it. Face data anchors HELLO / THANK YOU.
+    const dyn = dynamic.push(hand, result.face, result.timestampMs);
     if (dyn) {
       const pending = buf.currentWord;
       if (pending) {

@@ -2,8 +2,9 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CameraStream, estimateBrightness, type CameraError } from "@/lib/camera";
+import { FaceDetectorEngine } from "@/lib/recognition/faceDetector";
 import { HandLandmarkerEngine } from "@/lib/recognition/handLandmarker";
-import type { FrameResult } from "@/lib/recognition/types";
+import type { DetectedFace, FrameResult } from "@/lib/recognition/types";
 import { drawLandmarks } from "./LandmarkOverlay";
 
 export type CameraStatus =
@@ -30,6 +31,7 @@ export function CameraView({
   const lumaCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const cameraRef = useRef<CameraStream | null>(null);
   const engineRef = useRef<HandLandmarkerEngine | null>(null);
+  const faceRef = useRef<FaceDetectorEngine | null>(null);
   const rafRef = useRef<number | null>(null);
   const lumaTickRef = useRef<number>(0);
 
@@ -78,6 +80,21 @@ export function CameraView({
         }
         engineRef.current = engine;
 
+        // Face detector is best-effort: if it fails to load (older webview,
+        // CDN hiccup, etc.), we just keep going without face context.
+        FaceDetectorEngine.create({ delegate: "GPU" })
+          .catch(() => FaceDetectorEngine.create({ delegate: "CPU" }))
+          .then((face) => {
+            if (cancelled) {
+              face.close();
+              return;
+            }
+            faceRef.current = face;
+          })
+          .catch(() => {
+            /* ignore — dynamic matchers fall back gracefully */
+          });
+
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
         const ctx = canvas.getContext("2d");
@@ -90,17 +107,33 @@ export function CameraView({
         let lastBrightness = 128;
         let lastHandCount = 0;
 
+        // Face detection is throttled — running every frame doubles inference
+        // cost and the head doesn't move much between frames anyway. Re-detect
+        // every ~3 frames (~100ms at 30fps) and reuse the last result in between.
+        let lastFace: DetectedFace | null = null;
+        let faceTick = 0;
+
         const loop = () => {
           if (cancelled || !ctx || !engineRef.current) return;
           const t = performance.now();
 
           if (video.readyState >= 2) {
-            const result = engineRef.current.detect(video, t);
-            lastHandCount = result.hands.length;
+            const handResult = engineRef.current.detect(video, t);
+            lastHandCount = handResult.hands.length;
             if (showLandmarks) {
-              drawLandmarks(ctx, result.hands, canvas.width, canvas.height);
+              drawLandmarks(ctx, handResult.hands, canvas.width, canvas.height);
             }
-            onFrame?.(result);
+
+            faceTick = (faceTick + 1) % 3;
+            if (faceTick === 0 && faceRef.current) {
+              try {
+                lastFace = faceRef.current.detect(video, t);
+              } catch {
+                /* ignore transient detection errors */
+              }
+            }
+
+            onFrame?.({ ...handResult, face: lastFace });
           }
 
           // Sample brightness ~ every 500ms.
@@ -143,6 +176,8 @@ export function CameraView({
       rafRef.current = null;
       engineRef.current?.close();
       engineRef.current = null;
+      faceRef.current?.close();
+      faceRef.current = null;
       cameraRef.current?.stop();
       cameraRef.current = null;
     };
