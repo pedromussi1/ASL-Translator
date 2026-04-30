@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CameraView, type CameraStatus } from "@/components/CameraView";
 import { AlphabetClassifier } from "@/lib/recognition/classifier";
+import { DynamicSignDetector } from "@/lib/recognition/dynamicDetector";
 import { normalizeHand } from "@/lib/recognition/normalize";
 import { PredictionSmoother } from "@/lib/recognition/smoother";
 import type { DetectedHand, FrameResult, Prediction } from "@/lib/recognition/types";
@@ -28,13 +29,16 @@ export default function Home() {
   const classifierRef = useRef<AlphabetClassifier | null>(null);
   const smootherRef = useRef<PredictionSmoother | null>(null);
   const bufferRef = useRef<WordBuffer | null>(null);
+  const dynamicRef = useRef<DynamicSignDetector | null>(null);
   const ttsRef = useRef<WebSpeechProvider | null>(null);
   const inflightRef = useRef(false);
+  const [lastDynamic, setLastDynamic] = useState<string | null>(null);
 
   // Initialize the singletons once.
   useEffect(() => {
     bufferRef.current = new WordBuffer();
     smootherRef.current = new PredictionSmoother(5);
+    dynamicRef.current = new DynamicSignDetector();
     ttsRef.current = new WebSpeechProvider();
     const off = bufferRef.current.on((e) => {
       if (e.type === "letter_committed") {
@@ -91,18 +95,40 @@ export default function Home() {
   const onFrame = useCallback(async (result: FrameResult) => {
     const buf = bufferRef.current;
     const smoother = smootherRef.current;
+    const dynamic = dynamicRef.current;
     const cls = classifierRef.current;
-    if (!buf || !smoother) return;
-    if (!cls || result.hands.length === 0) {
+    if (!buf || !smoother || !dynamic) return;
+
+    const hand = result.hands.length > 0 ? pickPrimaryHand(result.hands) : null;
+
+    // Dynamic-sign detector runs first. If it fires, we bypass the letter
+    // pipeline — committing whatever's in the word buffer, then appending the
+    // dynamic word and speaking it.
+    const dyn = dynamic.push(hand, result.timestampMs);
+    if (dyn) {
+      const pending = buf.currentWord;
+      if (pending) {
+        setTranscript((prev) => [...prev, pending, dyn.label]);
+      } else {
+        setTranscript((prev) => [...prev, dyn.label]);
+      }
+      buf.clear();
+      smoother.reset();
+      setCurrentWord("");
+      setTentative({ letter: null, conf: 0 });
+      setLastDynamic(dyn.label);
+      ttsRef.current?.cancel();
+      ttsRef.current?.speak(dyn.label);
+      return;
+    }
+
+    if (!cls || !hand) {
       buf.feed(smoother.push(null), result.timestampMs);
       return;
     }
-    // Skip the frame if a previous recognition is still in flight to avoid
-    // backpressure.
     if (inflightRef.current) return;
     inflightRef.current = true;
     try {
-      const hand = pickPrimaryHand(result.hands);
       const norm = normalizeHand(hand.landmarks, hand.handedness);
       const raw: Prediction = await cls.recognize(norm);
       buf.feed(smoother.push(raw), result.timestampMs);
@@ -114,7 +140,9 @@ export default function Home() {
   const handleClear = () => {
     bufferRef.current?.clear();
     smootherRef.current?.reset();
+    dynamicRef.current?.reset();
     setTranscript([]);
+    setLastDynamic(null);
     ttsRef.current?.cancel();
   };
 
@@ -133,9 +161,16 @@ export default function Home() {
       </header>
 
       <p className="text-sm text-zinc-400 max-w-2xl">
-        Phase 1: fingerspelling alphabet. Hold each letter steady for ~300ms;
-        words commit when you drop your hand. Everything runs in your browser
-        — no frames leave your device.
+        Phase 1: fingerspelling alphabet plus a few dynamic signs.{" "}
+        <span className="text-zinc-300">
+          Hold each letter steady for ~300ms; words commit when you drop your hand.
+        </span>{" "}
+        Dynamic signs detected: <span className="font-mono">J</span>,{" "}
+        <span className="font-mono">Z</span>,{" "}
+        <span className="font-mono">YES</span> (fist nod),{" "}
+        <span className="font-mono">HELLO</span> (open-hand wave),{" "}
+        <span className="font-mono">THANK YOU</span>. Everything runs in your
+        browser — no frames leave your device.
       </p>
 
       <section className="rounded-xl overflow-hidden bg-zinc-900 border border-zinc-800 shadow-lg">
