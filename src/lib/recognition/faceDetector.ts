@@ -68,33 +68,26 @@ export class FaceDetectorEngine {
       }
     }
 
-    const face: DetectedFace = {};
-    for (const k of best.keypoints ?? []) {
-      const label = (k as { label?: string }).label;
-      const point: FaceKeypoint = { x: k.x, y: k.y };
-      switch (label) {
-        case "right_eye":
-          face.rightEye = point;
-          break;
-        case "left_eye":
-          face.leftEye = point;
-          break;
-        case "nose_tip":
-          face.noseTip = point;
-          break;
-        case "mouth_center":
-          face.mouthCenter = point;
-          break;
-        case "right_ear_tragion":
-          face.rightEar = point;
-          break;
-        case "left_ear_tragion":
-          face.leftEar = point;
-          break;
-      }
-    }
+    // BlazeFace short-range returns 6 keypoints in a fixed order; the JS SDK
+    // doesn't populate the `label` strings, so we index by position. Order is
+    // documented in MediaPipe's BlazeFace solution and is stable across
+    // releases.
+    //   0: right eye, 1: left eye, 2: nose tip, 3: mouth center,
+    //   4: right ear tragion, 5: left ear tragion
+    const kps = best.keypoints ?? [];
+    const at = (i: number): FaceKeypoint | undefined => {
+      const k = kps[i];
+      return k ? { x: k.x, y: k.y } : undefined;
+    };
 
-    return face;
+    return {
+      rightEye: at(0),
+      leftEye: at(1),
+      noseTip: at(2),
+      mouthCenter: at(3),
+      rightEar: at(4),
+      leftEar: at(5),
+    };
   }
 
   close(): void {

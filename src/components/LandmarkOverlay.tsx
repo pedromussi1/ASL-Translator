@@ -1,6 +1,6 @@
 "use client";
 
-import type { DetectedHand } from "@/lib/recognition/types";
+import type { DetectedFace, DetectedHand } from "@/lib/recognition/types";
 
 const HAND_CONNECTIONS: ReadonlyArray<readonly [number, number]> = [
   [0, 1], [1, 2], [2, 3], [3, 4],         // thumb
@@ -16,13 +16,12 @@ export function drawLandmarks(
   hands: DetectedHand[],
   width: number,
   height: number,
+  face?: DetectedFace | null,
 ): void {
   ctx.clearRect(0, 0, width, height);
-  if (hands.length === 0) return;
 
   for (const hand of hands) {
     const color = hand.handedness === "Right" ? "#22d3ee" : "#f472b6";
-
     ctx.strokeStyle = color;
     ctx.lineWidth = Math.max(2, width / 320);
     ctx.beginPath();
@@ -40,6 +39,32 @@ export function drawLandmarks(
       ctx.beginPath();
       ctx.arc(p.x * width, p.y * height, r, 0, Math.PI * 2);
       ctx.fill();
+    }
+  }
+
+  if (face) {
+    const r = Math.max(4, width / 180);
+    const points: Array<[{ x: number; y: number } | undefined, string]> = [
+      [face.rightEye, "rEye"],
+      [face.leftEye, "lEye"],
+      [face.noseTip, "nose"],
+      [face.mouthCenter, "mouth"],
+      [face.rightEar, "rEar"],
+      [face.leftEar, "lEar"],
+    ];
+    ctx.fillStyle = "#facc15"; // amber
+    ctx.strokeStyle = "rgba(0,0,0,0.65)";
+    ctx.lineWidth = 1;
+    ctx.font = `${Math.max(10, width / 90)}px ui-sans-serif, system-ui`;
+    for (const [p, label] of points) {
+      if (!p) continue;
+      const cx = p.x * width;
+      const cy = p.y * height;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillText(label, cx + r + 2, cy + 3);
     }
   }
 }

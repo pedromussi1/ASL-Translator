@@ -30,21 +30,32 @@ const FINGER_LM = {
   pinky: [17, 18, 19, 20],
 } as const;
 
+export interface MatcherScores {
+  J: number;
+  Z: number;
+  YES: number;
+  HELLO: number;
+  "THANK YOU": number;
+}
+
 /**
  * Heuristic detector for the five dynamic signs (J, Z, YES, HELLO, THANK YOU).
  * Each frame is buffered with pre-computed shape features; on every push we
  * evaluate all matchers and surface the highest-confidence hit above
  * `FIRE_THRESHOLD`. A short cooldown prevents repeat firings while the user
  * naturally returns to a neutral pose.
- *
- * J and Z and YES have unambiguous motion signatures — these are reliable.
- * HELLO and THANK YOU motions overlap (both are an open-hand outward sweep)
- * and ideally need face/pose landmarks to distinguish; we score them
- * conservatively until that pipeline is added.
  */
 export class DynamicSignDetector {
   private buffer: FrameFeatures[] = [];
   private cooldownUntil = 0;
+  private lastScores: MatcherScores = {
+    J: 0,
+    Z: 0,
+    YES: 0,
+    HELLO: 0,
+    "THANK YOU": 0,
+  };
+  private lastFacePresent = false;
 
   push(
     hand: DetectedHand | null,
@@ -66,15 +77,25 @@ export class DynamicSignDetector {
       this.buffer.shift();
     }
 
-    if (timestampMs < this.cooldownUntil) return null;
+    this.lastFacePresent = !!face;
+
     if (this.buffer.length < MIN_FRAMES_FOR_DETECTION) return null;
 
+    const j = matchJ(this.buffer, hand.handedness);
+    const z = matchZ(this.buffer, hand.handedness);
+    const yes = matchYes(this.buffer);
+    const hello = matchHello(this.buffer, hand.handedness);
+    const thanks = matchThankYou(this.buffer);
+    this.lastScores = { J: j, Z: z, YES: yes, HELLO: hello, "THANK YOU": thanks };
+
+    if (timestampMs < this.cooldownUntil) return null;
+
     const candidates: DynamicResult[] = [
-      { label: "J", confidence: matchJ(this.buffer, hand.handedness) },
-      { label: "Z", confidence: matchZ(this.buffer, hand.handedness) },
-      { label: "YES", confidence: matchYes(this.buffer) },
-      { label: "HELLO", confidence: matchHello(this.buffer, hand.handedness) },
-      { label: "THANK YOU", confidence: matchThankYou(this.buffer) },
+      { label: "J", confidence: j },
+      { label: "Z", confidence: z },
+      { label: "YES", confidence: yes },
+      { label: "HELLO", confidence: hello },
+      { label: "THANK YOU", confidence: thanks },
     ];
     candidates.sort((a, b) => b.confidence - a.confidence);
     const best = candidates[0];
@@ -85,9 +106,21 @@ export class DynamicSignDetector {
     return best;
   }
 
+  /** Latest per-matcher scores; useful for a debug HUD. */
+  getLastScores(): MatcherScores {
+    return { ...this.lastScores };
+  }
+
+  /** Whether the most recent frame had a face detected. */
+  isFacePresent(): boolean {
+    return this.lastFacePresent;
+  }
+
   reset(): void {
     this.buffer = [];
     this.cooldownUntil = 0;
+    this.lastScores = { J: 0, Z: 0, YES: 0, HELLO: 0, "THANK YOU": 0 };
+    this.lastFacePresent = false;
   }
 }
 
@@ -141,8 +174,11 @@ function dist3(p: Point3, q: Point3): number {
 // Matchers
 // ---------------------------------------------------------------------------
 
-const EXT_THRESH = 0.92;
-const CURL_THRESH = 0.83;
+// Real human hands rarely produce a "perfectly straight" finger; 0.92 was
+// too strict and the open-hand / pinky-out shapes were silently failing.
+// Wider thresholds with a comfortable gap between extended and curled.
+const EXT_THRESH = 0.85;
+const CURL_THRESH = 0.75;
 
 function shapePinkyOnly(f: FrameFeatures): number {
   // Pinky extended, index/middle/ring curled. Thumb is ambiguous in J handshape.

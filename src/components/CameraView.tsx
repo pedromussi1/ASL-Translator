@@ -120,9 +120,6 @@ export function CameraView({
           if (video.readyState >= 2) {
             const handResult = engineRef.current.detect(video, t);
             lastHandCount = handResult.hands.length;
-            if (showLandmarks) {
-              drawLandmarks(ctx, handResult.hands, canvas.width, canvas.height);
-            }
 
             faceTick = (faceTick + 1) % 3;
             if (faceTick === 0 && faceRef.current) {
@@ -131,6 +128,9 @@ export function CameraView({
               } catch {
                 /* ignore transient detection errors */
               }
+            }
+            if (showLandmarks) {
+              drawLandmarks(ctx, handResult.hands, canvas.width, canvas.height, lastFace);
             }
 
             onFrame?.({ ...handResult, face: lastFace });

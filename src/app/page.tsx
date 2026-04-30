@@ -3,7 +3,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CameraView, type CameraStatus } from "@/components/CameraView";
 import { AlphabetClassifier } from "@/lib/recognition/classifier";
-import { DynamicSignDetector } from "@/lib/recognition/dynamicDetector";
+import {
+  DynamicSignDetector,
+  type MatcherScores,
+} from "@/lib/recognition/dynamicDetector";
 import { normalizeHand } from "@/lib/recognition/normalize";
 import { PredictionSmoother } from "@/lib/recognition/smoother";
 import type { DetectedHand, FrameResult, Prediction } from "@/lib/recognition/types";
@@ -33,6 +36,15 @@ export default function Home() {
   const ttsRef = useRef<WebSpeechProvider | null>(null);
   const inflightRef = useRef(false);
   const [lastDynamic, setLastDynamic] = useState<string | null>(null);
+  const [scores, setScores] = useState<MatcherScores>({
+    J: 0,
+    Z: 0,
+    YES: 0,
+    HELLO: 0,
+    "THANK YOU": 0,
+  });
+  const [faceDetected, setFaceDetected] = useState(false);
+  const scoresTickRef = useRef(0);
 
   // Initialize the singletons once.
   useEffect(() => {
@@ -120,6 +132,14 @@ export default function Home() {
       ttsRef.current?.cancel();
       ttsRef.current?.speak(dyn.label);
       return;
+    }
+
+    // Throttle the score-panel state updates to ~6 Hz so we don't re-render
+    // every frame.
+    scoresTickRef.current = (scoresTickRef.current + 1) % 5;
+    if (scoresTickRef.current === 0) {
+      setScores(dynamic.getLastScores());
+      setFaceDetected(dynamic.isFacePresent());
     }
 
     if (!cls || !hand) {
@@ -234,6 +254,8 @@ export default function Home() {
         </button>
       </div>
 
+      <DynamicScoresHUD scores={scores} faceDetected={faceDetected} started={started} />
+
       <StatusBar status={status} />
 
       <footer className="text-xs text-zinc-500 pt-4 border-t border-zinc-800">
@@ -286,6 +308,54 @@ function Stat({ label, children }: { label: string; children: React.ReactNode })
     <div className="rounded-lg bg-zinc-900 border border-zinc-800 p-4 flex flex-col gap-2 min-h-24">
       <span className="text-xs uppercase tracking-widest text-zinc-500">{label}</span>
       <div>{children}</div>
+    </div>
+  );
+}
+
+function DynamicScoresHUD({
+  scores,
+  faceDetected,
+  started,
+}: {
+  scores: MatcherScores;
+  faceDetected: boolean;
+  started: boolean;
+}) {
+  if (!started) return null;
+  const labels: Array<keyof MatcherScores> = ["J", "Z", "YES", "HELLO", "THANK YOU"];
+  return (
+    <div className="rounded-lg bg-zinc-900 border border-zinc-800 p-3 flex flex-col gap-2 text-xs">
+      <div className="flex items-baseline justify-between">
+        <span className="uppercase tracking-widest text-zinc-500">Dynamic scores</span>
+        <span
+          className={
+            faceDetected ? "text-emerald-400" : "text-zinc-500"
+          }
+        >
+          face: {faceDetected ? "detected" : "not seen"}
+        </span>
+      </div>
+      <div className="grid grid-cols-5 gap-2">
+        {labels.map((l) => {
+          const v = scores[l];
+          const pct = Math.round(Math.max(0, Math.min(1, v)) * 100);
+          const ramp =
+            pct >= 70
+              ? "bg-emerald-500"
+              : pct >= 40
+                ? "bg-amber-500"
+                : "bg-zinc-700";
+          return (
+            <div key={l} className="flex flex-col gap-1 items-stretch">
+              <span className="text-[10px] uppercase tracking-widest text-zinc-400">{l}</span>
+              <div className="h-1.5 rounded bg-zinc-800 overflow-hidden">
+                <div className={`h-full ${ramp}`} style={{ width: `${pct}%` }} />
+              </div>
+              <span className="text-[10px] font-mono text-zinc-300">{v.toFixed(2)}</span>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
