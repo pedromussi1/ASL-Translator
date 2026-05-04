@@ -7,6 +7,7 @@ import {
   DynamicSignDetector,
   type MatcherScores,
 } from "@/lib/recognition/dynamicDetector";
+import { MotionMonitor } from "@/lib/recognition/motionMonitor";
 import { normalizeHand } from "@/lib/recognition/normalize";
 import { PredictionSmoother } from "@/lib/recognition/smoother";
 import type { DetectedHand, FrameResult, Prediction } from "@/lib/recognition/types";
@@ -44,13 +45,16 @@ export default function Home() {
     "THANK YOU": 0,
   });
   const [faceDetected, setFaceDetected] = useState(false);
+  const [inMotion, setInMotion] = useState(false);
   const scoresTickRef = useRef(0);
+  const motionRef = useRef<MotionMonitor | null>(null);
 
   // Initialize the singletons once.
   useEffect(() => {
     bufferRef.current = new WordBuffer();
     smootherRef.current = new PredictionSmoother(5);
     dynamicRef.current = new DynamicSignDetector();
+    motionRef.current = new MotionMonitor();
     ttsRef.current = new WebSpeechProvider();
     const off = bufferRef.current.on((e) => {
       if (e.type === "letter_committed") {
@@ -134,15 +138,22 @@ export default function Home() {
       return;
     }
 
+    // Suppress static-letter commits while the user's hand is moving so a
+    // dynamic sign (J starts as pinky-out / "I", Z as index-out / "D", YES as
+    // fist / "S") can't squeak through as a letter before the dynamic
+    // detector finishes its 1.5s buffer.
+    const userInMotion = motionRef.current?.push(hand) ?? false;
+
     // Throttle the score-panel state updates to ~6 Hz so we don't re-render
     // every frame.
     scoresTickRef.current = (scoresTickRef.current + 1) % 5;
     if (scoresTickRef.current === 0) {
       setScores(dynamic.getLastScores());
       setFaceDetected(dynamic.isFacePresent());
+      setInMotion(userInMotion);
     }
 
-    if (!cls || !hand) {
+    if (!cls || !hand || userInMotion) {
       buf.feed(smoother.push(null), result.timestampMs);
       return;
     }
@@ -161,8 +172,10 @@ export default function Home() {
     bufferRef.current?.clear();
     smootherRef.current?.reset();
     dynamicRef.current?.reset();
+    motionRef.current?.reset();
     setTranscript([]);
     setLastDynamic(null);
+    setInMotion(false);
     ttsRef.current?.cancel();
   };
 
@@ -254,7 +267,12 @@ export default function Home() {
         </button>
       </div>
 
-      <DynamicScoresHUD scores={scores} faceDetected={faceDetected} started={started} />
+      <DynamicScoresHUD
+        scores={scores}
+        faceDetected={faceDetected}
+        inMotion={inMotion}
+        started={started}
+      />
 
       <StatusBar status={status} />
 
@@ -315,25 +333,28 @@ function Stat({ label, children }: { label: string; children: React.ReactNode })
 function DynamicScoresHUD({
   scores,
   faceDetected,
+  inMotion,
   started,
 }: {
   scores: MatcherScores;
   faceDetected: boolean;
+  inMotion: boolean;
   started: boolean;
 }) {
   if (!started) return null;
   const labels: Array<keyof MatcherScores> = ["J", "Z", "YES", "HELLO", "THANK YOU"];
   return (
     <div className="rounded-lg bg-zinc-900 border border-zinc-800 p-3 flex flex-col gap-2 text-xs">
-      <div className="flex items-baseline justify-between">
+      <div className="flex items-baseline justify-between gap-3">
         <span className="uppercase tracking-widest text-zinc-500">Dynamic scores</span>
-        <span
-          className={
-            faceDetected ? "text-emerald-400" : "text-zinc-500"
-          }
-        >
-          face: {faceDetected ? "detected" : "not seen"}
-        </span>
+        <div className="flex items-baseline gap-3">
+          <span className={inMotion ? "text-cyan-300" : "text-zinc-500"}>
+            motion: {inMotion ? "yes (letters paused)" : "no"}
+          </span>
+          <span className={faceDetected ? "text-emerald-400" : "text-zinc-500"}>
+            face: {faceDetected ? "detected" : "not seen"}
+          </span>
+        </div>
       </div>
       <div className="grid grid-cols-5 gap-2">
         {labels.map((l) => {
