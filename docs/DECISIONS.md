@@ -195,17 +195,19 @@ Components in `src/components/` wire these together. No cross-imports between th
 
 ---
 
-## ADR-012 — `MotionMonitor` suppresses static letter commits during motion
+## ADR-012 — `MotionMonitor` suppresses static letter commits during motion (surgical)
 
 **Date:** 2026-05-04
 **Status:** Accepted
 
 **Context.** When the user signs J they hold the pinky-out shape (which the static classifier identifies as "I") throughout the entire motion. The classifier's prediction stays at "I" with high confidence the whole time, so after `stableHoldMs` (300 ms) the word buffer commits "I" — well before the dynamic detector's 1.5 s buffer can fire "J". Result: the transcript shows `I J` when the user only intended `J`. Same problem for Z (looks like "D" while moving).
 
-**Decision.** Insert a [`MotionMonitor`](../src/lib/recognition/motionMonitor.ts) into the per-frame pipeline. Each frame, compute the maximum fingertip displacement vs the previous frame; sum those max-speeds across a 5-frame sliding window; if the window total exceeds `0.025` (in normalized image coords), the user is "in motion." While in motion, feed `null` to the word buffer instead of the static classifier's prediction.
+**Decision.** Insert a [`MotionMonitor`](../src/lib/recognition/motionMonitor.ts) that tracks the maximum fingertip displacement vs the previous frame, summed across a 5-frame sliding window. If the window total exceeds `0.025` (in normalized image coords) the user is "in motion."
 
 **Why max, not mean.** Dynamic letters move only one finger meaningfully (pinky for J, index for Z); averaging across all five fingertips would dilute the signal below threshold for those signs.
 
-**Why a window, not single-frame.** Single-frame deltas are too noisy at the threshold. Summing across 5 frames smooths out flicker without adding meaningful latency (5 frames ≈ 165 ms, well under the 300 ms `stableHoldMs` already in the buffer).
+**Why a window, not single-frame.** Single-frame deltas are too noisy. Summing across 5 frames smooths out flicker without adding meaningful latency (5 frames ≈ 165 ms, well under the 300 ms `stableHoldMs`).
 
-**Trade-off.** Regular fingerspelling now requires a brief steady hold *between* letters — during the transition motion, letters are paused. This is naturally how ASL fingerspelling is paced, but very fast spellers will notice the difference.
+**Surgical scope.** Initially we used motion as a global gate — feed `null` to the word buffer for *any* letter while the hand was moving. This broke pose formation for static letters like C, E, F where fingers naturally flex into position; motion during formation triggered suppression and the letters never committed. The corrected rule: suppress *only* when the static classifier's current prediction is `I` or `D`, the prerequisite handshapes for J and Z. Every other letter commits normally during motion. The set of "dynamic-prerequisite" labels lives next to the page-level wiring and is updated alongside any new dynamic-sign matchers.
+
+**Trade-off.** Very fast spellers may briefly see an `I` before a `J` if they cycle through the I shape too quickly for the motion monitor to engage — the suppression only kicks in once the motion window has ~5 frames of accumulated finger movement.

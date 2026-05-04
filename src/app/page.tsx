@@ -3,10 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CameraView, type CameraStatus } from "@/components/CameraView";
 import { AlphabetClassifier } from "@/lib/recognition/classifier";
-import {
-  DynamicSignDetector,
-  type MatcherScores,
-} from "@/lib/recognition/dynamicDetector";
+import { DynamicSignDetector } from "@/lib/recognition/dynamicDetector";
 import { MotionMonitor } from "@/lib/recognition/motionMonitor";
 import { normalizeHand } from "@/lib/recognition/normalize";
 import { PredictionSmoother } from "@/lib/recognition/smoother";
@@ -18,6 +15,15 @@ type ClassifierState =
   | { kind: "loading" }
   | { kind: "ready" }
   | { kind: "error"; message: string };
+
+/**
+ * Static letters that share a handshape with a dynamic sign and therefore need
+ * motion-suppression: signing a J holds an "I" handshape throughout, signing a
+ * Z holds a "D" handshape. Every other letter commits normally during motion —
+ * suppressing them broke pose-formation for letters like C, E, F where fingers
+ * naturally flex into position.
+ */
+const DYNAMIC_PREREQUISITE_LETTERS = new Set(["I", "D"]);
 
 export default function Home() {
   const [started, setStarted] = useState(false);
@@ -36,15 +42,14 @@ export default function Home() {
   const dynamicRef = useRef<DynamicSignDetector | null>(null);
   const ttsRef = useRef<WebSpeechProvider | null>(null);
   const inflightRef = useRef(false);
-  const [lastDynamic, setLastDynamic] = useState<string | null>(null);
-  const [scores, setScores] = useState<MatcherScores>({ J: 0, Z: 0 });
-  const [inMotion, setInMotion] = useState(false);
-  const scoresTickRef = useRef(0);
   const motionRef = useRef<MotionMonitor | null>(null);
 
   // Initialize the singletons once.
   useEffect(() => {
-    bufferRef.current = new WordBuffer();
+    // Confidence threshold of 0.6 (vs the default 0.7) — cross-signer
+    // predictions for similar-shape letters often land in the 0.6-0.7 band,
+    // and the smoother + state machine already filter out one-frame flicker.
+    bufferRef.current = new WordBuffer({ confidenceThreshold: 0.6 });
     smootherRef.current = new PredictionSmoother(5);
     dynamicRef.current = new DynamicSignDetector();
     motionRef.current = new MotionMonitor();
@@ -125,27 +130,14 @@ export default function Home() {
       smoother.reset();
       setCurrentWord("");
       setTentative({ letter: null, conf: 0 });
-      setLastDynamic(dyn.label);
       ttsRef.current?.cancel();
       ttsRef.current?.speak(dyn.label);
       return;
     }
 
-    // Suppress static-letter commits while the user's hand is moving so a
-    // dynamic sign (J starts as pinky-out / "I", Z as index-out / "D")
-    // can't squeak through as a letter before the dynamic detector finishes
-    // its 1.5s buffer.
     const userInMotion = motionRef.current?.push(hand) ?? false;
 
-    // Throttle the score-panel state updates to ~6 Hz so we don't re-render
-    // every frame.
-    scoresTickRef.current = (scoresTickRef.current + 1) % 5;
-    if (scoresTickRef.current === 0) {
-      setScores(dynamic.getLastScores());
-      setInMotion(userInMotion);
-    }
-
-    if (!cls || !hand || userInMotion) {
+    if (!cls || !hand) {
       buf.feed(smoother.push(null), result.timestampMs);
       return;
     }
@@ -154,7 +146,13 @@ export default function Home() {
     try {
       const norm = normalizeHand(hand.landmarks, hand.handedness);
       const raw: Prediction = await cls.recognize(norm);
-      buf.feed(smoother.push(raw), result.timestampMs);
+      // Suppress only when the prediction is "I" (could become J) or "D"
+      // (could become Z) AND the hand is moving. Every other letter commits
+      // normally regardless of formation motion — that fixes C, E, F, and
+      // anything else where finger flex was being misread as dynamic motion.
+      const suppress =
+        userInMotion && DYNAMIC_PREREQUISITE_LETTERS.has(raw.label);
+      buf.feed(smoother.push(suppress ? null : raw), result.timestampMs);
     } finally {
       inflightRef.current = false;
     }
@@ -166,8 +164,6 @@ export default function Home() {
     dynamicRef.current?.reset();
     motionRef.current?.reset();
     setTranscript([]);
-    setLastDynamic(null);
-    setInMotion(false);
     ttsRef.current?.cancel();
   };
 
@@ -255,8 +251,6 @@ export default function Home() {
         </button>
       </div>
 
-      <DynamicScoresHUD scores={scores} inMotion={inMotion} started={started} />
-
       <StatusBar status={status} />
 
       <footer className="text-xs text-zinc-500 pt-4 border-t border-zinc-800">
@@ -309,50 +303,6 @@ function Stat({ label, children }: { label: string; children: React.ReactNode })
     <div className="rounded-lg bg-zinc-900 border border-zinc-800 p-4 flex flex-col gap-2 min-h-24">
       <span className="text-xs uppercase tracking-widest text-zinc-500">{label}</span>
       <div>{children}</div>
-    </div>
-  );
-}
-
-function DynamicScoresHUD({
-  scores,
-  inMotion,
-  started,
-}: {
-  scores: MatcherScores;
-  inMotion: boolean;
-  started: boolean;
-}) {
-  if (!started) return null;
-  const labels: Array<keyof MatcherScores> = ["J", "Z"];
-  return (
-    <div className="rounded-lg bg-zinc-900 border border-zinc-800 p-3 flex flex-col gap-2 text-xs">
-      <div className="flex items-baseline justify-between gap-3">
-        <span className="uppercase tracking-widest text-zinc-500">Motion-letter scores</span>
-        <span className={inMotion ? "text-cyan-300" : "text-zinc-500"}>
-          motion: {inMotion ? "yes (letters paused)" : "no"}
-        </span>
-      </div>
-      <div className="grid grid-cols-2 gap-2">
-        {labels.map((l) => {
-          const v = scores[l];
-          const pct = Math.round(Math.max(0, Math.min(1, v)) * 100);
-          const ramp =
-            pct >= 70
-              ? "bg-emerald-500"
-              : pct >= 40
-                ? "bg-amber-500"
-                : "bg-zinc-700";
-          return (
-            <div key={l} className="flex flex-col gap-1 items-stretch">
-              <span className="text-[10px] uppercase tracking-widest text-zinc-400">{l}</span>
-              <div className="h-1.5 rounded bg-zinc-800 overflow-hidden">
-                <div className={`h-full ${ramp}`} style={{ width: `${pct}%` }} />
-              </div>
-              <span className="text-[10px] font-mono text-zinc-300">{v.toFixed(2)}</span>
-            </div>
-          );
-        })}
-      </div>
     </div>
   );
 }
