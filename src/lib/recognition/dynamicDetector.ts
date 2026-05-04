@@ -1,10 +1,15 @@
-import type { DetectedFace, DetectedHand, Point3 } from "./types";
+import type { DetectedHand, Point3 } from "./types";
 
-export type DynamicLabel = "J" | "Z" | "YES" | "HELLO" | "THANK YOU";
+export type DynamicLabel = "J" | "Z";
 
 export interface DynamicResult {
   label: DynamicLabel;
   confidence: number;
+}
+
+export interface MatcherScores {
+  J: number;
+  Z: number;
 }
 
 interface FrameFeatures {
@@ -13,7 +18,6 @@ interface FrameFeatures {
   wrist: Point3;
   indexTip: Point3;
   pinkyTip: Point3;
-  face: DetectedFace | null;
 }
 
 const BUFFER_MS = 1500;
@@ -30,45 +34,36 @@ const FINGER_LM = {
   pinky: [17, 18, 19, 20],
 } as const;
 
-export interface MatcherScores {
-  J: number;
-  Z: number;
-  YES: number;
-  HELLO: number;
-  "THANK YOU": number;
-}
+// Real human hands rarely produce a "perfectly straight" finger; an extension
+// threshold of 0.92 was too strict and matchers were silently failing.
+const EXT_THRESH = 0.85;
+const CURL_THRESH = 0.75;
 
 /**
- * Heuristic detector for the five dynamic signs (J, Z, YES, HELLO, THANK YOU).
+ * Heuristic detector for the two dynamic signs (J and Z).
+ *
  * Each frame is buffered with pre-computed shape features; on every push we
- * evaluate all matchers and surface the highest-confidence hit above
+ * evaluate both matchers and surface the highest-confidence hit above
  * `FIRE_THRESHOLD`. A short cooldown prevents repeat firings while the user
  * naturally returns to a neutral pose.
+ *
+ * Both signs require an unambiguous handshape held throughout the buffer
+ * AND a specific motion signature, so static fingerspelling poses (an "I"
+ * held still, a "D" held still) don't false-fire.
  */
 export class DynamicSignDetector {
   private buffer: FrameFeatures[] = [];
   private cooldownUntil = 0;
-  private lastScores: MatcherScores = {
-    J: 0,
-    Z: 0,
-    YES: 0,
-    HELLO: 0,
-    "THANK YOU": 0,
-  };
-  private lastFacePresent = false;
+  private lastScores: MatcherScores = { J: 0, Z: 0 };
 
-  push(
-    hand: DetectedHand | null,
-    face: DetectedFace | null,
-    timestampMs: number,
-  ): DynamicResult | null {
+  push(hand: DetectedHand | null, timestampMs: number): DynamicResult | null {
     // Drop frames with no hand — they break trajectory continuity.
     if (!hand) {
       this.buffer = [];
       return null;
     }
 
-    const features = computeFeatures(hand, face, timestampMs);
+    const features = computeFeatures(hand, timestampMs);
     this.buffer.push(features);
 
     // Evict frames older than BUFFER_MS.
@@ -77,25 +72,17 @@ export class DynamicSignDetector {
       this.buffer.shift();
     }
 
-    this.lastFacePresent = !!face;
-
     if (this.buffer.length < MIN_FRAMES_FOR_DETECTION) return null;
 
     const j = matchJ(this.buffer, hand.handedness);
     const z = matchZ(this.buffer, hand.handedness);
-    const yes = matchYes(this.buffer);
-    const hello = matchHello(this.buffer, hand.handedness);
-    const thanks = matchThankYou(this.buffer);
-    this.lastScores = { J: j, Z: z, YES: yes, HELLO: hello, "THANK YOU": thanks };
+    this.lastScores = { J: j, Z: z };
 
     if (timestampMs < this.cooldownUntil) return null;
 
     const candidates: DynamicResult[] = [
       { label: "J", confidence: j },
       { label: "Z", confidence: z },
-      { label: "YES", confidence: yes },
-      { label: "HELLO", confidence: hello },
-      { label: "THANK YOU", confidence: thanks },
     ];
     candidates.sort((a, b) => b.confidence - a.confidence);
     const best = candidates[0];
@@ -111,16 +98,10 @@ export class DynamicSignDetector {
     return { ...this.lastScores };
   }
 
-  /** Whether the most recent frame had a face detected. */
-  isFacePresent(): boolean {
-    return this.lastFacePresent;
-  }
-
   reset(): void {
     this.buffer = [];
     this.cooldownUntil = 0;
-    this.lastScores = { J: 0, Z: 0, YES: 0, HELLO: 0, "THANK YOU": 0 };
-    this.lastFacePresent = false;
+    this.lastScores = { J: 0, Z: 0 };
   }
 }
 
@@ -128,11 +109,7 @@ export class DynamicSignDetector {
 // Feature extraction
 // ---------------------------------------------------------------------------
 
-function computeFeatures(
-  hand: DetectedHand,
-  face: DetectedFace | null,
-  timestampMs: number,
-): FrameFeatures {
+function computeFeatures(hand: DetectedHand, timestampMs: number): FrameFeatures {
   const lms = hand.landmarks;
   return {
     timestampMs,
@@ -146,7 +123,6 @@ function computeFeatures(
     wrist: lms[0],
     indexTip: lms[8],
     pinkyTip: lms[20],
-    face,
   };
 }
 
@@ -174,14 +150,7 @@ function dist3(p: Point3, q: Point3): number {
 // Matchers
 // ---------------------------------------------------------------------------
 
-// Real human hands rarely produce a "perfectly straight" finger; 0.92 was
-// too strict and the open-hand / pinky-out shapes were silently failing.
-// Wider thresholds with a comfortable gap between extended and curled.
-const EXT_THRESH = 0.85;
-const CURL_THRESH = 0.75;
-
 function shapePinkyOnly(f: FrameFeatures): number {
-  // Pinky extended, index/middle/ring curled. Thumb is ambiguous in J handshape.
   const pinky = f.fingers.pinky;
   const others = [f.fingers.index, f.fingers.middle, f.fingers.ring];
   if (pinky < EXT_THRESH) return 0;
@@ -195,20 +164,6 @@ function shapeIndexOnly(f: FrameFeatures): number {
   if (index < EXT_THRESH) return 0;
   if (others.some((x) => x > CURL_THRESH)) return 0;
   return clamp01((index - EXT_THRESH) / (1 - EXT_THRESH));
-}
-
-function shapeFist(f: FrameFeatures): number {
-  const all = [f.fingers.index, f.fingers.middle, f.fingers.ring, f.fingers.pinky];
-  if (all.some((x) => x > CURL_THRESH)) return 0;
-  // The lower the max extension, the tighter the fist.
-  const maxExt = Math.max(...all);
-  return clamp01(1 - (maxExt - 0.6) / (CURL_THRESH - 0.6));
-}
-
-function shapeOpenHand(f: FrameFeatures): number {
-  const all = [f.fingers.index, f.fingers.middle, f.fingers.ring, f.fingers.pinky];
-  if (all.some((x) => x < EXT_THRESH)) return 0;
-  return Math.min(...all.map((x) => clamp01((x - EXT_THRESH) / (1 - EXT_THRESH))));
 }
 
 /** Average shape score across all frames (must hold the shape throughout). */
@@ -229,18 +184,15 @@ function matchJ(buf: FrameFeatures[], handedness: "Left" | "Right"): number {
   const yRange = Math.max(...ys) - Math.min(...ys);
   if (yRange < 0.08 || xRange < 0.04) return 0;
 
-  // The video is mirrored — for a right-handed user signing J, on-screen the
-  // hand actually moves left→right but in MediaPipe's image coords (which are
-  // not mirrored) the pinky goes RIGHT then DOWN-LEFT. Same direction logic
-  // works for both hands once we account for which is "outside".
+  // The video is mirrored on screen — for a right-handed user signing J, on
+  // screen the hand moves left→right but in MediaPipe's image coords (which
+  // are NOT mirrored) the pinky goes RIGHT then DOWN-LEFT.
   const earlyX = avg(xs.slice(0, Math.floor(xs.length / 4)));
   const lateX = avg(xs.slice(-Math.floor(xs.length / 4)));
   const earlyY = avg(ys.slice(0, Math.floor(ys.length / 4)));
   const lateY = avg(ys.slice(-Math.floor(ys.length / 4)));
 
   const movedDown = lateY > earlyY ? 1 : 0;
-  // J ends curving toward thumb side. For right hand on screen (= "Left" in
-  // MediaPipe's labeling because image isn't flipped) the curve goes left.
   const expectedXMoves = handedness === "Right" ? lateX < earlyX : lateX > earlyX;
   const motionScore =
     movedDown * (Math.min(yRange, 0.3) / 0.3) * (expectedXMoves ? 1 : 0.4);
@@ -253,7 +205,6 @@ function matchZ(buf: FrameFeatures[], handedness: "Left" | "Right"): number {
   const shape = avgShape(buf, shapeIndexOnly);
   if (shape < 0.4) return 0;
 
-  // Sample 4 evenly-spaced keyframes.
   const n = buf.length;
   const k = [
     buf[Math.floor(n * 0.05)],
@@ -264,7 +215,6 @@ function matchZ(buf: FrameFeatures[], handedness: "Left" | "Right"): number {
   const x = k.map((f) => f.indexTip.x);
   const y = k.map((f) => f.indexTip.y);
 
-  // Sign-flip x deltas if user's right hand is on the screen-mirrored side.
   const mirror = handedness === "Right" ? -1 : 1;
   const dx1 = (x[1] - x[0]) * mirror; // expect rightward
   const dx2 = (x[2] - x[1]) * mirror; // expect leftward
@@ -275,131 +225,11 @@ function matchZ(buf: FrameFeatures[], handedness: "Left" | "Right"): number {
   const yRange = Math.max(...y) - Math.min(...y);
   if (xRange < 0.06 || yRange < 0.04) return 0;
 
-  // Each segment contributes proportionally to its directional correctness.
   const s1 = clamp01(dx1 / 0.05);
   const s2 = clamp01(-dx2 / 0.05) * clamp01(dy2 / 0.04);
   const s3 = clamp01(dx3 / 0.05);
   const traj = (s1 + s2 + s3) / 3;
   return clamp01(shape * 0.3 + traj * 0.85);
-}
-
-// YES — fist with vertical oscillation (bobbing up and down).
-function matchYes(buf: FrameFeatures[]): number {
-  const shape = avgShape(buf, shapeFist);
-  if (shape < 0.4) return 0;
-
-  const ys = buf.map((f) => f.wrist.y);
-  const range = Math.max(...ys) - Math.min(...ys);
-  if (range < 0.03) return 0;
-
-  // Count direction reversals of dy as a proxy for oscillation.
-  let reversals = 0;
-  let prevSign = 0;
-  for (let i = 1; i < ys.length; i++) {
-    const d = ys[i] - ys[i - 1];
-    if (Math.abs(d) < 0.002) continue;
-    const s = d > 0 ? 1 : -1;
-    if (prevSign !== 0 && s !== prevSign) reversals++;
-    prevSign = s;
-  }
-  if (reversals < 2) return 0;
-
-  const oscScore = clamp01(reversals / 4);
-  const ampScore = clamp01(range / 0.08);
-  return clamp01(shape * 0.4 + oscScore * 0.5 + ampScore * 0.3);
-}
-
-// HELLO — open hand at the temple, salute-like sweep outward. With face
-// landmarks we anchor "near temple" to the actual ear/eye position rather
-// than guessing from absolute screen y.
-function matchHello(buf: FrameFeatures[], handedness: "Left" | "Right"): number {
-  const shape = avgShape(buf, shapeOpenHand);
-  if (shape < 0.5) return 0;
-
-  const start = buf[0].wrist;
-  const end = buf[buf.length - 1].wrist;
-  const face = buf[0].face;
-
-  const mirror = handedness === "Right" ? -1 : 1;
-  const dx = (end.x - start.x) * mirror;
-  if (dx < 0.05) return 0;
-
-  let proximityScore: number;
-  if (face) {
-    const faceHeight = faceVerticalSize(face);
-    const eyeY =
-      face.rightEye?.y ?? face.leftEye?.y ?? face.noseTip?.y ?? null;
-    const sideEar = handedness === "Right" ? face.rightEar : face.leftEar;
-    const anchorEyeY = eyeY ?? 0.4;
-    const dyToEye = Math.abs(start.y - anchorEyeY);
-    const verticalCloseness = clamp01(1 - dyToEye / Math.max(faceHeight, 0.1));
-    if (verticalCloseness < 0.3) return 0;
-
-    let lateralScore = 0.5;
-    if (sideEar) {
-      // For a right-handed user, the right ear is on the LEFT of the
-      // unmirrored frame. The hand starts at or just outside the same-side ear.
-      const earDelta = (sideEar.x - start.x) * mirror;
-      lateralScore = clamp01(0.5 + earDelta * 4);
-    }
-    proximityScore = verticalCloseness * 0.6 + lateralScore * 0.4;
-  } else {
-    if (start.y > 0.55) return 0;
-    proximityScore = 0.4;
-  }
-
-  const motion = clamp01(dx / 0.18);
-  const score = motion * proximityScore * clamp01(shape);
-  return clamp01(face ? score : Math.min(0.7, score));
-}
-
-// THANK YOU — open hand starts at the chin/mouth, palm toward signer, sweeps
-// outward and slightly down. With face landmarks we anchor "near mouth" to
-// the actual mouth keypoint.
-function matchThankYou(buf: FrameFeatures[]): number {
-  const shape = avgShape(buf, shapeOpenHand);
-  if (shape < 0.5) return 0;
-
-  const start = buf[0].wrist;
-  const end = buf[buf.length - 1].wrist;
-  const face = buf[0].face;
-
-  const yMove = end.y - start.y;
-  if (yMove < 0.04) return 0;
-  const xMove = Math.abs(end.x - start.x);
-
-  let proximityScore: number;
-  if (face) {
-    const mouth = face.mouthCenter ?? face.noseTip ?? null;
-    if (!mouth) {
-      proximityScore = 0.4;
-    } else {
-      const faceHeight = faceVerticalSize(face);
-      const dy = Math.abs(start.y - mouth.y);
-      const dx = Math.abs(start.x - mouth.x);
-      proximityScore =
-        clamp01(1 - dy / Math.max(faceHeight, 0.1)) *
-        clamp01(1 - dx / Math.max(faceHeight, 0.1));
-      if (proximityScore < 0.3) return 0;
-    }
-  } else {
-    if (start.y > 0.5) return 0;
-    proximityScore = 0.4;
-  }
-
-  const motion = clamp01(yMove / 0.15) * clamp01((yMove + xMove) / 0.2);
-  const score = motion * proximityScore * clamp01(shape);
-  return clamp01(face ? score : Math.min(0.7, score));
-}
-
-/** Approximate face vertical span in normalized coords using available keypoints. */
-function faceVerticalSize(face: DetectedFace): number {
-  const eyeY = face.rightEye?.y ?? face.leftEye?.y ?? null;
-  const mouthY = face.mouthCenter?.y ?? null;
-  if (eyeY !== null && mouthY !== null) {
-    return Math.max(0.05, Math.abs(mouthY - eyeY) * 2);
-  }
-  return 0.2;
 }
 
 // ---------------------------------------------------------------------------

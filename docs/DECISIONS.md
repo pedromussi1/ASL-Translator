@@ -83,9 +83,9 @@ Components in `src/components/` wire these together. No cross-imports between th
 ## ADR-006 — Heuristic dynamic-sign detector, not an LSTM
 
 **Date:** 2026-04-30
-**Status:** Accepted (revisit if vocabulary expands beyond ~10 signs)
+**Status:** Accepted, scope reduced — see [ADR-007](#adr-007) for the YES / HELLO / THANK YOU rollback.
 
-**Context.** Phase 1 needs to recognize five dynamic signs (J, Z, YES, HELLO, THANK YOU). Three implementation paths were on the table:
+**Context.** Phase 1 originally targeted five dynamic signs (J, Z, YES, HELLO, THANK YOU). Three implementation paths were on the table:
 
 1. Self-recorded LSTM — quick recording UX (~10 min user effort), then PyTorch training and ONNX export.
 2. Public-dataset LSTM — WLASL has HELLO/THANK YOU/YES, but J and Z are letters and live in different fingerspelling datasets. Multi-dataset wrangling for five signs is poor ROI.
@@ -93,29 +93,43 @@ Components in `src/components/` wire these together. No cross-imports between th
 
 **Decision.** Build a heuristic [`DynamicSignDetector`](../src/lib/recognition/dynamicDetector.ts). Each sign has a hand-shape predicate (e.g. pinky-out for J) plus a motion-pattern predicate (e.g. pinky tip drops then curves toward thumb side). A 1.5s rolling buffer feeds all matchers per push; a 1.5s cooldown prevents repeat firings.
 
-**Why.** Five specific signs is small enough to handcraft well, the user explicitly rejected a self-recording UX after testing personal calibration (see [ADR-009](#adr-009)), and a heuristic ships in an afternoon vs days of dataset prep. The interface (`push(hand, face, t) → DynamicResult | null`) doesn't lock us into heuristics — an LSTM-backed implementation can drop in behind the same shape later.
+**Why.** A small handful of signs is small enough to handcraft well, the user explicitly rejected a self-recording UX after testing personal calibration (see [ADR-009](#adr-009)), and a heuristic ships in an afternoon vs days of dataset prep. The interface (`push(hand, t) → DynamicResult | null`) doesn't lock us into heuristics — an LSTM-backed implementation can drop in behind the same shape later.
 
-**Trade-off.** Doesn't scale beyond ~10 signs without becoming unmaintainable. HELLO and THANK YOU heuristics are intrinsically rough without face/pose context (mitigated by [ADR-007](#adr-007)).
+**Current scope.** J and Z only. The other three are retired in [ADR-007](#adr-007).
+
+**Trade-off.** Doesn't scale beyond ~10 signs without becoming unmaintainable. Phase 2 will likely need a real model.
 
 ---
 
-## ADR-007 — `FaceDetector` (6 keypoints) over `FaceLandmarker` (478 points)
+## ADR-007 — Reverted: face landmarks (and YES / HELLO / THANK YOU)
 
-**Date:** 2026-04-30
-**Status:** Accepted
+**Date:** 2026-05-04
+**Status:** Reverted (originally added 2026-04-30)
 
-**Context.** The HELLO and THANK YOU dynamic-sign matchers need to anchor "near the temple" and "near the mouth" to the user's actual head, not absolute screen y-coordinate. MediaPipe Tasks-Vision Web exposes two face options:
+**Context.** Phase 1 originally tried to recognize five dynamic signs. Three of them — YES, HELLO, THANK YOU — are defined relative to the signer's head (fist near chin, open hand at temple, etc.). To anchor "near the head" reliably, we added MediaPipe `FaceDetector` (BlazeFace short-range, 6 keypoints — eyes, nose tip, mouth center, ears) running alongside `HandLandmarker` in `CameraView`.
 
-- `FaceDetector` — BlazeFace short-range, returns bounding box + 6 keypoints (eyes, nose tip, mouth center, ear tragions). ~3 MB model.
-- `FaceLandmarker` — 478 face mesh points. Order of magnitude larger model, slower per-frame.
+**What we tried.**
 
-**Decision.** Use `FaceDetector`. Run it every 3rd frame (face moves slowly) in [`CameraView`](../src/components/CameraView.tsx) alongside `HandLandmarker`, share the same WASM `FilesetResolver`.
+- The `FaceDetector` itself worked: keypoints rendered correctly once we discovered the JS SDK doesn't populate `keypoint.label` and we switched to position-based indexing.
+- The `matchHello` / `matchThankYou` / `matchYes` matchers used the keypoints to score "near temple" / "near mouth" / "fist nodding" plus motion direction.
 
-**Why.** All we need is "where is the head, where is the mouth, where is the same-side ear" — those are exactly four of the six BlazeFace keypoints. The 478-point mesh would be overkill for the question we're asking and would visibly burn battery for nothing.
+**What didn't work.** Even with face anchors, HELLO and THANK YOU were unreliable in real testing. The motions are coarse, vary a lot per signer, and overlap each other. YES (fist nodding) misfired during natural fingerspelling pauses. The user reported the experience as "giving so many issues."
 
-**Trade-off.** No precise mouth-shape or brow-position info, which would matter in Phase 3 when ASL non-manual markers (eyebrow raise = question) drive grammar. Phase 3 will likely upgrade to `FaceLandmarker` or pose-only approaches.
+**Decision.** Remove the `FaceDetector` integration entirely and drop YES / HELLO / THANK YOU from Phase 1. Keep J and Z in the heuristic detector — those have unambiguous trajectories and worked reliably.
 
-**Note.** The JS SDK does not populate `keypoint.label` strings — the wrapper in [`faceDetector.ts`](../src/lib/recognition/faceDetector.ts) indexes by position (BlazeFace's documented order: 0=right eye, 1=left eye, 2=nose tip, 3=mouth center, 4=right ear, 5=left ear).
+**What was deleted.**
+
+- `src/lib/recognition/faceDetector.ts`
+- The `DetectedFace` / `FaceKeypoint` types
+- `face` field on `FrameResult`
+- `FaceDetectorEngine` initialization in `CameraView`
+- `matchYes`, `matchHello`, `matchThankYou` matchers
+- The `face: detected | not seen` HUD indicator
+- Face keypoint visualization on the canvas overlay
+
+**Recoverable.** All of the above lives in git history. Phase 2 may revisit with `FaceLandmarker` (full 478-point mesh) if we need non-manual-marker recognition for ASL grammar.
+
+**What we kept.** The `MotionMonitor` and `PredictionSmoother` — both are independent of face data and useful for fingerspelling alone.
 
 ---
 
@@ -178,3 +192,20 @@ Components in `src/components/` wire these together. No cross-imports between th
 **Why.** Calibrated against actual MediaPipe output on a live hand. The synthetic test helper builds finger landmarks colinearly so its ratios are exactly 1.0 (extended) or 0.33 (curled) — those tests still pass with the lower thresholds. Real-world ratios sit in the 0.85–0.99 range for "extended" and 0.40–0.70 for "curled."
 
 **Trade-off.** Slight risk of false positives on poses where a finger is in the ambiguous 0.75–0.85 band (e.g. a half-curled index in some fingerspelling letters). The shape-score ramp goes to 0 outside the bands, so impact is limited to motion-trajectory-positive false fires, which the buffer's other constraints (motion magnitude, direction, cooldown) further suppress.
+
+---
+
+## ADR-012 — `MotionMonitor` suppresses static letter commits during motion
+
+**Date:** 2026-05-04
+**Status:** Accepted
+
+**Context.** When the user signs J they hold the pinky-out shape (which the static classifier identifies as "I") throughout the entire motion. The classifier's prediction stays at "I" with high confidence the whole time, so after `stableHoldMs` (300 ms) the word buffer commits "I" — well before the dynamic detector's 1.5 s buffer can fire "J". Result: the transcript shows `I J` when the user only intended `J`. Same problem for Z (looks like "D" while moving).
+
+**Decision.** Insert a [`MotionMonitor`](../src/lib/recognition/motionMonitor.ts) into the per-frame pipeline. Each frame, compute the maximum fingertip displacement vs the previous frame; sum those max-speeds across a 5-frame sliding window; if the window total exceeds `0.025` (in normalized image coords), the user is "in motion." While in motion, feed `null` to the word buffer instead of the static classifier's prediction.
+
+**Why max, not mean.** Dynamic letters move only one finger meaningfully (pinky for J, index for Z); averaging across all five fingertips would dilute the signal below threshold for those signs.
+
+**Why a window, not single-frame.** Single-frame deltas are too noisy at the threshold. Summing across 5 frames smooths out flicker without adding meaningful latency (5 frames ≈ 165 ms, well under the 300 ms `stableHoldMs` already in the buffer).
+
+**Trade-off.** Regular fingerspelling now requires a brief steady hold *between* letters — during the transition motion, letters are paused. This is naturally how ASL fingerspelling is paced, but very fast spellers will notice the difference.

@@ -7,23 +7,20 @@ A real-time American Sign Language → text + speech translator that runs **enti
 ## What works today
 
 - **Fingerspelling A–Z** via a tiny MLP trained on Kaggle ASL Alphabet (98.06% test accuracy). The browser runs the ONNX in WASM.
-- **Five dynamic signs** via a heuristic detector that combines hand-shape + landmark trajectory + face anchors:
+- **The two motion letters** via a heuristic detector that combines hand-shape + landmark trajectory:
   - **J** — pinky out, traces a J
   - **Z** — index out, draws a Z in the air
-  - **YES** — fist nodding up and down
-  - **HELLO** — open hand at temple, sweep outward (anchored to your eye / ear position)
-  - **THANK YOU** — open hand at chin, sweep outward and down (anchored to your mouth)
+- **Motion suppression** (`MotionMonitor`) that pauses static letter commits while the hand is moving so an `I` doesn't sneak through ahead of a `J`.
 - **5-frame temporal smoother** between the classifier and the word buffer to drop single-frame flicker.
-- **On-device face detection** (MediaPipe BlazeFace short-range, 6 keypoints — eyes, nose, mouth, ears) running every 3rd frame to give the dynamic matchers a head reference.
 - **Word buffer state machine** that handles repeated letters via a 200ms release threshold (HELLO, BOOK work).
 - **Web Speech API TTS** behind a `TTSProvider` interface so a cloud TTS can drop in later.
-- **Live "Dynamic scores" HUD** showing per-matcher confidence so you can see what's near firing.
+- **Live HUD** showing motion state and J / Z matcher scores.
 
 ## Phased roadmap
 
 | Phase | Scope | Status |
 |---|---|---|
-| 1 | Fingerspelling A–Z + 5 dynamic signs (J, Z, YES, HELLO, THANK YOU) + on-device privacy | shipping incrementally |
+| 1 | Fingerspelling A–Z including the motion letters J and Z, all on-device | shipping incrementally |
 | 2 | Vocabulary recognition (~250–1000 signs) + Tauri 2 desktop wrapper | planned |
 | 3 | Continuous conversational ASL + iOS (Swift + CoreML) | research / future |
 
@@ -31,11 +28,10 @@ A real-time American Sign Language → text + speech translator that runs **enti
 
 - **Web:** Next.js 16 (App Router) + TypeScript + Tailwind CSS
 - **Hand tracking:** [`@mediapipe/tasks-vision`](https://www.npmjs.com/package/@mediapipe/tasks-vision) `HandLandmarker` — GPU delegate, CPU fallback
-- **Face tracking:** `@mediapipe/tasks-vision` `FaceDetector` (BlazeFace short-range, 6 keypoints — chosen over the 478-point FaceLandmarker for cost; see [ADR-007](docs/DECISIONS.md))
 - **Static-letter inference:** [`onnxruntime-web`](https://onnxruntime.ai/docs/get-started/with-javascript.html) (WASM EP; WebGPU when available)
-- **Dynamic signs:** purpose-built heuristic detector — hand-shape + landmark trajectory + face anchors. No LSTM; see [ADR-006](docs/DECISIONS.md) for why.
+- **Motion letters (J, Z):** purpose-built heuristic detector — hand-shape + landmark trajectory. No LSTM; see [ADR-006](docs/DECISIONS.md) for why.
 - **Speech output:** Web Speech API behind a `TTSProvider` interface
-- **Tests:** Vitest (37 unit tests as of latest)
+- **Tests:** Vitest (36 unit tests as of latest)
 - **Training (separate, Python):** PyTorch + MediaPipe Tasks API for landmark extraction, exported to ONNX
 
 ## Run locally
@@ -59,12 +55,12 @@ src/
     ├── camera/index.ts           # getUserMedia wrapper, brightness check
     ├── recognition/
     │   ├── handLandmarker.ts     # MediaPipe Tasks HandLandmarker wrapper
-    │   ├── faceDetector.ts       # MediaPipe Tasks FaceDetector wrapper (6 keypoints)
     │   ├── normalize.ts          # wrist-relative, scale-invariant features (mirror left hand)
     │   ├── classifier.ts         # ONNX Runtime Web wrapper for the static MLP
     │   ├── smoother.ts           # 5-frame sliding-window prediction smoother
+    │   ├── motionMonitor.ts      # pauses static letters while the hand is in motion
     │   ├── wordBuffer.ts         # state machine: letters → words → speech triggers
-    │   ├── dynamicDetector.ts    # heuristic detector for J/Z/YES/HELLO/THANK YOU
+    │   ├── dynamicDetector.ts    # heuristic detector for J and Z
     │   └── types.ts              # shared types
     └── tts/
         ├── provider.ts           # TTSProvider interface
@@ -101,10 +97,11 @@ The big design decisions and their rationale live in [`docs/DECISIONS.md`](docs/
 
 - **Single Next.js app for Phase 1** — monorepo overhead deferred until Phase 2 ([ADR-001](docs/DECISIONS.md)).
 - **All inference on-device.** Privacy is a real product feature here, not a footnote.
-- **Heuristic over LSTM for the 5 dynamic signs** — handcrafted matchers were faster to ship and the user explicitly rejected a self-recording UX ([ADR-006](docs/DECISIONS.md)).
-- **Face anchors for HELLO / THANK YOU** — added FaceDetector keypoints because absolute screen y-coordinate is too brittle for "near temple" / "near mouth" ([ADR-007](docs/DECISIONS.md)).
+- **Heuristic over LSTM for the motion letters J and Z** — handcrafted matchers were faster to ship and the user explicitly rejected a self-recording UX ([ADR-006](docs/DECISIONS.md)).
+- **Face landmarks were tried and removed** — added FaceDetector to anchor HELLO/THANK YOU/YES, but those signs were unreliable in practice and have been dropped from Phase 1. Phase 1 is now fingerspelling-focused ([ADR-007](docs/DECISIONS.md)).
 - **Online data augmentation** in static-letter training — gave up <0.3% in-distribution accuracy for cross-signer robustness ([ADR-008](docs/DECISIONS.md)).
 - **Personal calibration was tried and reverted** — kept in git history; the better lever turned out to be a more diverse dataset rather than per-user fine-tuning ([ADR-009](docs/DECISIONS.md)).
+- **Motion suppression** prevents an `I` from committing as a letter while the user is mid-J ([ADR-012](docs/DECISIONS.md)).
 - **Pluggable TTS interface** so Phase 2 can drop in cloud TTS without refactors.
 
 ## Acknowledgements

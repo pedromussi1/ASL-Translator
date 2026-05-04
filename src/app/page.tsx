@@ -37,14 +37,7 @@ export default function Home() {
   const ttsRef = useRef<WebSpeechProvider | null>(null);
   const inflightRef = useRef(false);
   const [lastDynamic, setLastDynamic] = useState<string | null>(null);
-  const [scores, setScores] = useState<MatcherScores>({
-    J: 0,
-    Z: 0,
-    YES: 0,
-    HELLO: 0,
-    "THANK YOU": 0,
-  });
-  const [faceDetected, setFaceDetected] = useState(false);
+  const [scores, setScores] = useState<MatcherScores>({ J: 0, Z: 0 });
   const [inMotion, setInMotion] = useState(false);
   const scoresTickRef = useRef(0);
   const motionRef = useRef<MotionMonitor | null>(null);
@@ -119,8 +112,8 @@ export default function Home() {
 
     // Dynamic-sign detector runs first. If it fires, we bypass the letter
     // pipeline — committing whatever's in the word buffer, then appending the
-    // dynamic word and speaking it. Face data anchors HELLO / THANK YOU.
-    const dyn = dynamic.push(hand, result.face, result.timestampMs);
+    // dynamic letter and speaking it.
+    const dyn = dynamic.push(hand, result.timestampMs);
     if (dyn) {
       const pending = buf.currentWord;
       if (pending) {
@@ -139,9 +132,9 @@ export default function Home() {
     }
 
     // Suppress static-letter commits while the user's hand is moving so a
-    // dynamic sign (J starts as pinky-out / "I", Z as index-out / "D", YES as
-    // fist / "S") can't squeak through as a letter before the dynamic
-    // detector finishes its 1.5s buffer.
+    // dynamic sign (J starts as pinky-out / "I", Z as index-out / "D")
+    // can't squeak through as a letter before the dynamic detector finishes
+    // its 1.5s buffer.
     const userInMotion = motionRef.current?.push(hand) ?? false;
 
     // Throttle the score-panel state updates to ~6 Hz so we don't re-render
@@ -149,7 +142,6 @@ export default function Home() {
     scoresTickRef.current = (scoresTickRef.current + 1) % 5;
     if (scoresTickRef.current === 0) {
       setScores(dynamic.getLastScores());
-      setFaceDetected(dynamic.isFacePresent());
       setInMotion(userInMotion);
     }
 
@@ -194,16 +186,12 @@ export default function Home() {
       </header>
 
       <p className="text-sm text-zinc-400 max-w-2xl">
-        Phase 1: fingerspelling alphabet plus a few dynamic signs.{" "}
+        Phase 1: fingerspelling alphabet A–Z, plus the two motion letters{" "}
+        <span className="font-mono">J</span> and <span className="font-mono">Z</span>.{" "}
         <span className="text-zinc-300">
           Hold each letter steady for ~300ms; words commit when you drop your hand.
         </span>{" "}
-        Dynamic signs detected: <span className="font-mono">J</span>,{" "}
-        <span className="font-mono">Z</span>,{" "}
-        <span className="font-mono">YES</span> (fist nod),{" "}
-        <span className="font-mono">HELLO</span> (open-hand wave),{" "}
-        <span className="font-mono">THANK YOU</span>. Everything runs in your
-        browser — no frames leave your device.
+        Everything runs in your browser — no frames leave your device.
       </p>
 
       <section className="rounded-xl overflow-hidden bg-zinc-900 border border-zinc-800 shadow-lg">
@@ -267,12 +255,7 @@ export default function Home() {
         </button>
       </div>
 
-      <DynamicScoresHUD
-        scores={scores}
-        faceDetected={faceDetected}
-        inMotion={inMotion}
-        started={started}
-      />
+      <DynamicScoresHUD scores={scores} inMotion={inMotion} started={started} />
 
       <StatusBar status={status} />
 
@@ -332,31 +315,24 @@ function Stat({ label, children }: { label: string; children: React.ReactNode })
 
 function DynamicScoresHUD({
   scores,
-  faceDetected,
   inMotion,
   started,
 }: {
   scores: MatcherScores;
-  faceDetected: boolean;
   inMotion: boolean;
   started: boolean;
 }) {
   if (!started) return null;
-  const labels: Array<keyof MatcherScores> = ["J", "Z", "YES", "HELLO", "THANK YOU"];
+  const labels: Array<keyof MatcherScores> = ["J", "Z"];
   return (
     <div className="rounded-lg bg-zinc-900 border border-zinc-800 p-3 flex flex-col gap-2 text-xs">
       <div className="flex items-baseline justify-between gap-3">
-        <span className="uppercase tracking-widest text-zinc-500">Dynamic scores</span>
-        <div className="flex items-baseline gap-3">
-          <span className={inMotion ? "text-cyan-300" : "text-zinc-500"}>
-            motion: {inMotion ? "yes (letters paused)" : "no"}
-          </span>
-          <span className={faceDetected ? "text-emerald-400" : "text-zinc-500"}>
-            face: {faceDetected ? "detected" : "not seen"}
-          </span>
-        </div>
+        <span className="uppercase tracking-widest text-zinc-500">Motion-letter scores</span>
+        <span className={inMotion ? "text-cyan-300" : "text-zinc-500"}>
+          motion: {inMotion ? "yes (letters paused)" : "no"}
+        </span>
       </div>
-      <div className="grid grid-cols-5 gap-2">
+      <div className="grid grid-cols-2 gap-2">
         {labels.map((l) => {
           const v = scores[l];
           const pct = Math.round(Math.max(0, Math.min(1, v)) * 100);
